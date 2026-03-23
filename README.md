@@ -49,6 +49,45 @@ It still does not gather facts from managed nodes.
 
 For controller job monitoring, it also harvests historical job-to-host observations so transient inventories that are created and deleted through the AAP API can still be counted after the job has completed.
 
+## Supported Deployment Topologies
+
+The controller-facing commands work anywhere the Automation Controller API is reachable over HTTPS.
+
+That includes:
+
+- AAP deployed by the Operator on Red Hat OpenShift
+- AAP deployed in containers on RHEL with Podman
+- self-managed AAP running in AWS or Azure
+- managed service variants such as Red Hat Ansible Automation Platform on Microsoft Azure and the Red Hat Ansible Automation Platform Service on AWS
+
+The utility talks to the controller API, so the deployment model mainly changes the URL you pass and the TLS trust chain you need.
+
+Typical examples:
+
+- OpenShift route:
+  `https://aap.apps.cluster.example.com`
+- Podman or containerized RHEL install:
+  `https://controller.example.com`
+- managed Azure deployment:
+  use the `platformUrl` value exposed by the Azure managed application outputs
+- managed AWS service:
+  use the service or platform URL exposed for that deployment
+
+TLS options:
+
+- use `--ca-file /path/to/ca-bundle.pem` for private or custom certificate chains
+- use `--insecure` only as a fallback for testing or short-lived troubleshooting
+
+Example with a custom CA bundle:
+
+```bash
+python3 node_counter.py sync \
+  --controller-url 'https://aap.apps.cluster.example.com' \
+  --token '...' \
+  --ca-file /etc/pki/ca-trust/source/anchors/aap-ca.pem \
+  --state-db /var/lib/node-counter/node_counter_state.db
+```
+
 ## Key Design Choice
 
 When deduplicating, the utility prefers stable identity fields in this order:
@@ -261,6 +300,16 @@ python3 node_counter.py count \
   --list
 ```
 
+If your environment uses a private CA, prefer `--ca-file`:
+
+```bash
+python3 node_counter.py count \
+  --controller-url 'https://controller.example.com' \
+  --token '...' \
+  --ca-file /etc/pki/ca-trust/source/anchors/aap-ca.pem \
+  --list
+```
+
 ## Recommended Inventory Pattern for Indirectly Managed Assets
 
 For assets managed behind an API, represent each managed object as an inventory host and provide a canonical identity variable.
@@ -303,6 +352,38 @@ That keeps both objects countable without fact gathering even though they share 
 - total unique nodes observed in that window
 - whether the database currently covers the full requested window
 - an optional readable list with first observed, last observed, and jobs observed or snapshots observed
+
+Example `report --source jobs --days 30 --list` output:
+
+```text
+Mode: job-report
+Data source: jobs
+State database: /var/lib/node-counter/node_counter_state.db
+Controller scope: https://controller.example.com
+Window: last 30 days
+Requested start: 2026-02-21T12:00:00+00:00
+Requested end: 2026-03-23T12:00:00+00:00
+Jobs considered: 418
+Unique managed nodes observed: 1264
+Observation rows considered: 3910
+Oldest observation in database: 2025-12-23T09:15:12+00:00
+Newest observation in database: 2026-03-23T11:58:41+00:00
+Full requested window covered: yes
+
+Observed Nodes:
+1. server1.example.com [var:ansible_host] (jobs=24)
+   identity: 192.0.2.10
+   first observed: 2026-02-22T03:10:44+00:00
+   last observed: 2026-03-23T11:58:41+00:00
+   aliases: server1.example.com, server1-dr.example.com
+   inventories: Production, Disaster Recovery
+2. vm-001 [var:node_count_id] (jobs=8)
+   identity: vm-001
+   first observed: 2026-03-01T00:14:19+00:00
+   last observed: 2026-03-20T18:42:07+00:00
+   aliases: vm-001
+   inventories: VMware API Inventory
+```
 
 JSON output is available for all commands:
 

@@ -316,6 +316,10 @@ def add_source_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Skip TLS certificate verification for controller API calls.",
     )
+    parser.add_argument(
+        "--ca-file",
+        help="Custom CA bundle to trust for controller API calls.",
+    )
 
 
 def add_controller_mode_arguments(parser: argparse.ArgumentParser) -> None:
@@ -355,6 +359,10 @@ def add_controller_mode_arguments(parser: argparse.ArgumentParser) -> None:
         "--insecure",
         action="store_true",
         help="Skip TLS certificate verification for controller API calls.",
+    )
+    parser.add_argument(
+        "--ca-file",
+        help="Custom CA bundle to trust for controller API calls.",
     )
 
 
@@ -1111,12 +1119,11 @@ class ControllerClient:
         base_url: str,
         headers: Mapping[str, str],
         verify_tls: bool = True,
+        ca_file: str | None = None,
     ) -> None:
-        self.base_url = discover_controller_api_base(base_url, headers, verify_tls)
+        self.base_url = discover_controller_api_base(base_url, headers, verify_tls, ca_file)
         self.headers = dict(headers)
-        self.ssl_context = ssl.create_default_context()
-        if not verify_tls:
-            self.ssl_context = ssl._create_unverified_context()  # noqa: SLF001
+        self.ssl_context = build_ssl_context(verify_tls=verify_tls, ca_file=ca_file)
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "ControllerClient":
@@ -1139,6 +1146,7 @@ class ControllerClient:
             base_url=args.controller_url,
             headers=headers,
             verify_tls=not args.insecure,
+            ca_file=args.ca_file,
         )
 
     def get_json(self, url_or_path: str) -> dict[str, Any]:
@@ -1182,6 +1190,7 @@ def discover_controller_api_base(
     base_url: str,
     headers: Mapping[str, str],
     verify_tls: bool,
+    ca_file: str | None,
 ) -> str:
     cleaned = base_url.rstrip("/") + "/"
     parsed = parse.urlparse(cleaned)
@@ -1192,9 +1201,7 @@ def discover_controller_api_base(
         parse.urljoin(cleaned, "api/controller/v2/"),
         parse.urljoin(cleaned, "api/v2/"),
     )
-    ssl_context = ssl.create_default_context()
-    if not verify_tls:
-        ssl_context = ssl._create_unverified_context()  # noqa: SLF001
+    ssl_context = build_ssl_context(verify_tls=verify_tls, ca_file=ca_file)
 
     for candidate in candidates:
         req = request.Request(candidate, headers=headers, method="GET")
@@ -1207,6 +1214,14 @@ def discover_controller_api_base(
     raise NodeCounterError(
         "unable to discover the controller API root; try passing a full /api/.../v2 URL"
     )
+
+
+def build_ssl_context(verify_tls: bool, ca_file: str | None) -> ssl.SSLContext:
+    if not verify_tls:
+        return ssl._create_unverified_context()  # noqa: SLF001
+    if ca_file:
+        return ssl.create_default_context(cafile=ca_file)
+    return ssl.create_default_context()
 
 
 def deduplicate_hosts(
