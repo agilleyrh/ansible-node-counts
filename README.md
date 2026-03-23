@@ -1,36 +1,49 @@
 # Node Counter and Monitor for Ansible and AAP 2.6+
 
-`node_counter.py` is a lightweight command-line utility for:
+`node_counter.py` counts unique managed nodes without gathering facts from those nodes.
 
-- running a one-time unique node count
-- capturing recurring node snapshots from inventory or automation controller
-- harvesting historical controller jobs across all inventories
-- continuously monitoring controller job activity
-- reporting unique nodes observed over a rolling 30, 60, or 90 day window
+It supports:
 
-The design deliberately avoids the problems below:
+- one-time counting from inventory or controller
+- historical monitoring from controller job data
+- continuous monitoring for transient inventories and short-lived hosts
+- rolling 30/60/90-day reports
+- optional event-based identities for indirect or API-managed resources
 
-- No fact gathering or fact caching is required.
-- No third-party Python packages are required beyond what normally ships with Python and Ansible.
-- Duplicate hosts can be collapsed across multiple inventories.
-- Multiple aliases for the same target can be deduplicated with `ansible_host`, explicit identity variables, and optional DNS resolution.
-- API-managed or indirectly managed objects can be counted more accurately when inventories provide a canonical ID such as `node_count_id`.
-- Monitoring state is stored in a local SQLite database from the Python standard library.
-- Ephemeral inventories can be preserved locally by harvesting finished jobs before controller cleanup removes them.
-- The monitor can snapshot live inventory host variables for running jobs before the inventory is deleted.
-- The monitor can also harvest explicit resource identity markers from job events for indirect/API-managed objects.
+## Why This Exists
 
-## Command Summary
+The utility is designed around the problems described in the original node-counting brief:
 
-The utility now has five commands:
+- fact gathering and fact caching are too expensive in large environments
+- the same node can appear under multiple names or in multiple inventories
+- inventories and hosts may be created on the fly and deleted after a job finishes
+- direct inventory state alone is not enough for historical counting
+
+The design stays lightweight:
+
+- no third-party Python packages are required
+- no fact gathering is required
+- monitoring state is stored in SQLite from the Python standard library
+
+## Recommended Approach
+
+For AAP environments, the recommended workflow is:
+
+1. Run `sync` once to backfill recent completed jobs.
+2. Run `monitor` continuously to capture active-job host data and newly finished jobs.
+3. Run `report --source jobs --days 30|60|90` for your rolling counts.
+
+Use `capture` only when you specifically want periodic point-in-time inventory snapshots.
+
+## Commands
 
 - `count`: one-time count from inventory or controller
-- `capture`: take a deduplicated snapshot and store it in SQLite
-- `sync`: harvest finished controller jobs into SQLite
-- `monitor`: continuously harvest finished controller jobs into SQLite
-- `report`: report unique nodes observed in the last N days from harvested jobs or stored captures
+- `capture`: store a point-in-time snapshot in SQLite
+- `sync`: backfill finished controller jobs into SQLite
+- `monitor`: continuously harvest active and finished controller jobs into SQLite
+- `report`: build a rolling report from harvested jobs or snapshots
 
-For backward compatibility, the old style still works and maps to `count`.
+For backward compatibility, running the script without a subcommand still maps to `count`.
 
 Example:
 
@@ -40,49 +53,39 @@ python3 node_counter.py -i inventories/prod/hosts.yml --list
 
 ## What It Counts
 
-This utility counts the nodes currently represented in:
+The utility counts identities represented in:
 
-- one or more Ansible inventories, or
-- one or more AAP / automation controller inventories exposed by the controller API
+- Ansible inventory data
+- Automation Controller inventory host data
+- harvested controller job history
+- optional explicit identity markers found in job events
 
-For multi-day monitoring, it counts unique nodes observed across captured snapshots or harvested controller jobs in the selected time window.
+It does not gather facts from managed nodes.
 
-It still does not gather facts from managed nodes.
+For controller monitoring, `monitor` improves accuracy for transient inventories by snapshotting host definitions for active jobs before those inventories or hosts are deleted.
 
-For controller job monitoring, it also harvests historical job-to-host observations so transient inventories that are created and deleted through the AAP API can still be counted after the job has completed.
+## Supported AAP Deployments
 
-When `monitor` is running continuously, it first snapshots the host definitions for active jobs and then harvests completed jobs. That improves deduplication for short-lived inventories because `ansible_host` and custom identity vars can be preserved before the controller deletes the underlying host record.
+The controller-facing commands work anywhere the Automation Controller API is reachable over HTTPS, including:
 
-## Supported Deployment Topologies
+- AAP on OpenShift using the Operator
+- AAP in containers on RHEL with Podman
+- self-managed AAP in AWS or Azure
+- managed service variants on AWS or Azure
 
-The controller-facing commands work anywhere the Automation Controller API is reachable over HTTPS.
+Typical controller URLs:
 
-That includes:
-
-- AAP deployed by the Operator on Red Hat OpenShift
-- AAP deployed in containers on RHEL with Podman
-- self-managed AAP running in AWS or Azure
-- managed service variants such as Red Hat Ansible Automation Platform on Microsoft Azure and the Red Hat Ansible Automation Platform Service on AWS
-
-The utility talks to the controller API, so the deployment model mainly changes the URL you pass and the TLS trust chain you need.
-
-Typical examples:
-
-- OpenShift route:
-  `https://aap.apps.cluster.example.com`
-- Podman or containerized RHEL install:
-  `https://controller.example.com`
-- managed Azure deployment:
-  use the `platformUrl` value exposed by the Azure managed application outputs
-- managed AWS service:
-  use the service or platform URL exposed for that deployment
+- OpenShift route: `https://aap.apps.cluster.example.com`
+- Podman or RHEL containerized install: `https://controller.example.com`
+- managed Azure deployment: use the deployment `platformUrl`
+- managed AWS service: use the service or platform URL for that deployment
 
 TLS options:
 
-- use `--ca-file /path/to/ca-bundle.pem` for private or custom certificate chains
-- use `--insecure` only as a fallback for testing or short-lived troubleshooting
+- use `--ca-file /path/to/ca-bundle.pem` for private or custom CA chains
+- use `--insecure` only for short-lived troubleshooting
 
-Example with a custom CA bundle:
+Example:
 
 ```bash
 python3 node_counter.py sync \
@@ -92,48 +95,28 @@ python3 node_counter.py sync \
   --state-db /var/lib/node-counter/node_counter_state.db
 ```
 
-## What It Still Needs From Your AAP Content
+## Identity and Deduplication
 
-The utility can infer direct managed nodes from inventory and job history on its own.
+The deduplication order is:
 
-For indirect or API-managed objects, the most reliable path is to expose a stable identity in one of two ways:
-
-- represent the object as a distinct inventory host and set `node_count_id`
-- emit a stable identity in job output or `set_stats`, then run the monitor with `--harvest-event-identities`
-
-Recommended event keys are:
-
-- `node_count_id`
-- `managed_node_id`
-- `instance_id`
-- `vm_uuid`
-- `system_uuid`
-
-Plural list forms are also supported, for example:
-
-- `managed_node_ids`
-- `node_count_ids`
-
-## Key Design Choice
-
-When deduplicating, the utility prefers stable identity fields in this order:
-
-1. User-supplied `--identity-var` values
-2. Built-in identity variables:
+1. user-supplied `--identity-var`
+2. built-in identity vars:
    `node_count_id`, `managed_node_id`, `instance_id`, `vm_uuid`, `system_uuid`
 3. `ansible_host` or `ansible_ssh_host`
-4. Inventory hostname
+4. inventory hostname
 
-This matters for indirect/API-based automation.
+This is important for both duplicate collapse and indirect/API-managed objects.
 
-Example:
+Examples:
 
-- If multiple inventory entries point at the same server through different DNS names, the utility can collapse them using `ansible_host` or `--resolve-dns`.
-- If multiple managed objects share the same API endpoint, you should set a canonical per-object value such as `node_count_id` so they are counted separately instead of collapsing behind the same `ansible_host`.
+- If `server1.example.com` and `server1-dr.example.com` both use `ansible_host: 192.0.2.10`, they collapse to one node.
+- If two API-managed objects share one endpoint, give each object a stable identity such as `node_count_id` so they count separately.
 
-## One-Time Counting
+## Quick Start
 
-Count across two inventories:
+### One-Time Count
+
+Inventory-based:
 
 ```bash
 python3 node_counter.py count \
@@ -142,26 +125,7 @@ python3 node_counter.py count \
   --list
 ```
 
-Limit the count to the same host pattern Ansible would target:
-
-```bash
-python3 node_counter.py count \
-  -i inventories/prod/hosts.yml \
-  --limit 'linux:&patch_window_a' \
-  --list
-```
-
-Collapse aliases that resolve to the same IP:
-
-```bash
-python3 node_counter.py count \
-  -i inventories/prod/hosts.yml \
-  -i inventories/network/hosts.yml \
-  --resolve-dns \
-  --list
-```
-
-Controller example with OAuth:
+Controller-based:
 
 ```bash
 export CONTROLLER_OAUTH_TOKEN='...'
@@ -173,33 +137,18 @@ python3 node_counter.py count \
   --list
 ```
 
-## Monitoring for 30, 60, or 90 Days
+### Historical Monitoring
 
-There are now two monitoring models:
-
-- snapshot monitoring via `capture`
-- event-style controller monitoring via `sync` and `monitor`
-
-For AAP controller environments, the job-based model is the recommended one because it preserves historical evidence of inventories and hosts that only existed briefly.
-
-### Recommended Controller Monitoring Workflow
-
-1. Run `sync` once to backfill existing controller jobs.
-2. Run `monitor` continuously or on a very short interval.
-3. Run `report --source jobs --days 30|60|90`.
-
-Initial backfill of the last 90 days from all inventories on the controller:
+Initial backfill:
 
 ```bash
-export CONTROLLER_OAUTH_TOKEN='...'
-
 python3 node_counter.py sync \
   --controller-url 'https://controller.example.com' \
   --state-db /var/lib/node-counter/node_counter_state.db \
   --days-back 90
 ```
 
-Continuous monitoring of all controller jobs across all inventories:
+Continuous monitoring:
 
 ```bash
 python3 node_counter.py monitor \
@@ -208,7 +157,60 @@ python3 node_counter.py monitor \
   --interval-seconds 60
 ```
 
-Continuous monitoring with explicit event identity harvesting for indirect/API-managed resources:
+30-day report:
+
+```bash
+python3 node_counter.py report \
+  --state-db /var/lib/node-counter/node_counter_state.db \
+  --source jobs \
+  --days 30 \
+  --list
+```
+
+### Snapshot Monitoring
+
+Controller snapshot:
+
+```bash
+python3 node_counter.py capture \
+  --controller-url 'https://controller.example.com' \
+  --inventory-name 'Production' \
+  --state-db /var/lib/node-counter/node_counter_state.db
+```
+
+Snapshot report:
+
+```bash
+python3 node_counter.py report \
+  --state-db /var/lib/node-counter/node_counter_state.db \
+  --source snapshots \
+  --days 30 \
+  --list
+```
+
+## Indirect and API-Managed Resources
+
+The utility can infer direct managed nodes from inventory and job history on its own.
+
+For indirect or API-managed objects, use one of these patterns:
+
+- model each managed object as its own inventory host and set a stable identity like `node_count_id`
+- emit explicit resource identities in job output or `set_stats`, then run with `--harvest-event-identities`
+
+Recommended event keys:
+
+- `node_count_id`
+- `managed_node_id`
+- `instance_id`
+- `vm_uuid`
+- `system_uuid`
+
+Plural list forms also work, for example:
+
+- `managed_node_ids`
+- `node_count_ids`
+
+Example:
 
 ```bash
 python3 node_counter.py monitor \
@@ -220,142 +222,7 @@ python3 node_counter.py monitor \
   --event-identity-var managed_node_id
 ```
 
-30-day report from harvested jobs:
-
-```bash
-python3 node_counter.py report \
-  --state-db /var/lib/node-counter/node_counter_state.db \
-  --source jobs \
-  --days 30 \
-  --list
-```
-
-90-day report for one controller scope when a shared database is used:
-
-```bash
-python3 node_counter.py report \
-  --state-db /var/lib/node-counter/node_counter_state.db \
-  --source jobs \
-  --controller-url 'https://controller.example.com' \
-  --days 90 \
-  --format json
-```
-
-### Snapshot Monitoring Workflow
-
-The snapshot workflow is:
-
-1. Run `capture` on a schedule.
-2. Store the SQLite database on persistent storage.
-3. Run `report --days 30`, `--days 60`, or `--days 90`.
-
-Capture a controller snapshot:
-
-```bash
-python3 node_counter.py capture \
-  --controller-url 'https://controller.example.com' \
-  --inventory-name 'Production' \
-  --state-db /var/lib/node-counter/node_counter_state.db
-```
-
-Capture an inventory snapshot:
-
-```bash
-python3 node_counter.py capture \
-  -i inventories/prod/hosts.yml \
-  -i inventories/dr/hosts.yml \
-  --resolve-dns \
-  --state-db /var/lib/node-counter/node_counter_state.db
-```
-
-Report on the last 30 days:
-
-```bash
-python3 node_counter.py report \
-  --state-db /var/lib/node-counter/node_counter_state.db \
-  --source snapshots \
-  --days 30 \
-  --list
-```
-
-Report JSON for the last 90 days:
-
-```bash
-python3 node_counter.py report \
-  --state-db /var/lib/node-counter/node_counter_state.db \
-  --source snapshots \
-  --days 90 \
-  --format json
-```
-
-### Scheduling Guidance
-
-For most environments:
-
-- run `sync` once for historical backfill
-- run `monitor` every 30 to 60 seconds for controller-based historical tracking
-- run `capture` once per day only when you specifically need inventory-state snapshots
-- place the SQLite file on persistent storage, not in an ephemeral execution environment filesystem
-- enable `--harvest-event-identities` when playbooks or collections can emit stable IDs for indirect/API-managed objects
-
-This maps well to an AAP scheduled job template or to `cron`.
-
-### What the 30/60/90 Day Report Means
-
-For job-based reports, the `report` command returns the number of unique deduplicated nodes that appeared in at least one harvested job during the requested lookback window.
-
-For snapshot-based reports, it returns the number of unique deduplicated nodes that appeared in at least one snapshot during the requested lookback window.
-
-That helps with:
-
-- rotating inventories
-- duplicate hostnames across inventories
-- longer-horizon estate visibility
-- inventories created on the fly and deleted after a job completes
-
-It does not infer assets that were never present in any harvested job or snapshot.
-
-Very short-lived assets can still be missed if controller job records are cleaned up before the monitor harvests them, so the monitor interval matters.
-
-For transient inventories specifically, continuous `monitor` mode is more accurate than periodic `sync` because it snapshots active-job host variables before cleanup.
-
-## Controller Mode
-
-```bash
-python3 node_counter.py count \
-  --controller-url 'https://controller.example.com' \
-  --username admin \
-  --password 'secret' \
-  --inventory-id 7 \
-  --inventory-id 12 \
-  --format json
-```
-
-If your environment uses a self-signed controller certificate:
-
-```bash
-python3 node_counter.py count \
-  --controller-url 'https://controller.example.com' \
-  --token '...' \
-  --insecure \
-  --list
-```
-
-If your environment uses a private CA, prefer `--ca-file`:
-
-```bash
-python3 node_counter.py count \
-  --controller-url 'https://controller.example.com' \
-  --token '...' \
-  --ca-file /etc/pki/ca-trust/source/anchors/aap-ca.pem \
-  --list
-```
-
-## Recommended Inventory Pattern for Indirectly Managed Assets
-
-For assets managed behind an API, represent each managed object as an inventory host and provide a canonical identity variable.
-
-Example:
+Recommended inventory pattern for API-managed assets:
 
 ```yaml
 all:
@@ -368,31 +235,22 @@ all:
       node_count_id: vm-002
 ```
 
-That keeps both objects countable without fact gathering even though they share the same automation endpoint.
+## What the Report Means
 
-## Output
+For `--source jobs`, `report` returns the number of unique deduplicated identities observed in harvested controller jobs during the selected window.
 
-`count` text output shows:
+For `--source snapshots`, it returns the number of unique deduplicated identities observed in stored snapshots during the selected window.
 
-- total source records examined
-- total unique managed nodes
-- number of duplicates collapsed
-- the identity precedence used
-- an optional readable list of deduplicated nodes
+That helps with:
 
-`capture` text output also shows:
+- duplicate hostnames across inventories
+- rotating inventories
+- longer-horizon controller visibility
+- inventories created and deleted through the AAP API
 
-- capture timestamp
-- snapshot ID
-- state database path
+It does not infer assets that never appeared in harvested data.
 
-`report` text output shows:
-
-- requested 30/60/90-day window
-- jobs or snapshots considered
-- total unique nodes observed in that window
-- whether the database currently covers the full requested window
-- an optional readable list with first observed, last observed, and jobs observed or snapshots observed
+## Sample Report
 
 Example `report --source jobs --days 30 --list` output:
 
@@ -432,28 +290,35 @@ Observed Nodes:
    inventories: Cloud API Inventory
 ```
 
-JSON output is available for all commands:
+JSON output is available for every command.
+
+Example:
 
 ```bash
 python3 node_counter.py count -i inventories/prod/hosts.yml --format json
 ```
 
-## Constraints and Caveats
+## Operational Notes
 
-- This is intentionally inventory-driven. If a node is not represented in inventory or controller data, it cannot be counted.
-- Multi-day monitoring depends on recurring captures. If you only start collecting today, the database will not immediately contain a full 90-day history.
-- Job-based monitoring depends on controller job retention lasting long enough for the harvester to ingest the job history. A shorter polling interval reduces that risk.
-- Smart inventory and controller-host variable inheritance can still depend on how the environment is modeled.
-- DNS-based deduplication is optional because name resolution policies vary by environment.
-- Indirect or API-managed objects still need stable inventory modeling. If several objects share one API endpoint, use a canonical variable such as `node_count_id`.
-- If your execution environment is ephemeral, store the SQLite database on a mounted persistent path.
-- The utility can reliably preserve hosts used by transient inventories when `monitor` is running continuously. A one-time backfill cannot recover host variables that were already deleted before collection.
-- The utility still cannot generically infer every downstream cloud resource or API object touched inside a playbook unless those resources are represented as distinct inventory identities or emitted through explicit instrumentation such as event identity markers.
-- Historical harvesting currently focuses on standard controller jobs. If your estate relies heavily on other controller execution record types, those would need a further extension.
+- Store the SQLite database on persistent storage.
+- For controller-based history, `monitor` every 30 to 60 seconds is a reasonable starting point.
+- For point-in-time inventory snapshots, `capture` once per day is usually enough.
+- Enable `--harvest-event-identities` when playbooks or collections can emit stable IDs for indirect/API-managed objects.
+
+## Limitations
+
+- The utility is still driven by inventory, controller, and harvested job data. If an identity never appears there, it cannot be counted.
+- A one-time backfill cannot recover host variables that were already deleted before collection.
+- Very short-lived assets can still be missed if controller records disappear before `monitor` harvests them.
+- Smart inventory behavior and inherited controller variables can affect what is visible through the API.
+- DNS-based deduplication is optional because name resolution policies differ by environment.
+- The tool still cannot generically infer every downstream cloud or API object touched inside a playbook unless that object is modeled explicitly or emitted through event markers.
+- Historical harvesting currently focuses on standard controller jobs. Additional controller execution record types would need a further extension.
+- The utility does not yet encode every business-rule decision from the node-definition guidance in your source documents. It counts observed identities; it does not fully classify edge cases like “containers on VMs” versus “OpenShift deployments.”
 
 ## Testing
 
-The included tests cover the deduplication rules and the capture/report database workflow and do not require Ansible to be installed:
+The test suite does not require Ansible to be installed:
 
 ```bash
 python3 -m unittest discover -s tests
