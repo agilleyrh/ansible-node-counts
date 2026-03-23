@@ -4,6 +4,8 @@
 
 - running a one-time unique node count
 - capturing recurring node snapshots from inventory or automation controller
+- harvesting historical controller jobs across all inventories
+- continuously monitoring controller job activity
 - reporting unique nodes observed over a rolling 30, 60, or 90 day window
 
 The design deliberately avoids the problems below:
@@ -14,14 +16,17 @@ The design deliberately avoids the problems below:
 - Multiple aliases for the same target can be deduplicated with `ansible_host`, explicit identity variables, and optional DNS resolution.
 - API-managed or indirectly managed objects can be counted more accurately when inventories provide a canonical ID such as `node_count_id`.
 - Monitoring state is stored in a local SQLite database from the Python standard library.
+- Ephemeral inventories can be preserved locally by harvesting finished jobs before controller cleanup removes them.
 
 ## Command Summary
 
-The utility now has three commands:
+The utility now has five commands:
 
 - `count`: one-time count from inventory or controller
 - `capture`: take a deduplicated snapshot and store it in SQLite
-- `report`: report unique nodes observed in the last N days from stored captures
+- `sync`: harvest finished controller jobs into SQLite
+- `monitor`: continuously harvest finished controller jobs into SQLite
+- `report`: report unique nodes observed in the last N days from harvested jobs or stored captures
 
 For backward compatibility, the old style still works and maps to `count`.
 
@@ -38,9 +43,11 @@ This utility counts the nodes currently represented in:
 - one or more Ansible inventories, or
 - one or more AAP / automation controller inventories exposed by the controller API
 
-For multi-day monitoring, it counts unique nodes observed across captured snapshots in the selected time window.
+For multi-day monitoring, it counts unique nodes observed across captured snapshots or harvested controller jobs in the selected time window.
 
 It still does not gather facts from managed nodes.
+
+For controller job monitoring, it also harvests historical job-to-host observations so transient inventories that are created and deleted through the AAP API can still be counted after the job has completed.
 
 ## Key Design Choice
 
@@ -103,7 +110,63 @@ python3 node_counter.py count \
 
 ## Monitoring for 30, 60, or 90 Days
 
-The monitoring workflow is:
+There are now two monitoring models:
+
+- snapshot monitoring via `capture`
+- event-style controller monitoring via `sync` and `monitor`
+
+For AAP controller environments, the job-based model is the recommended one because it preserves historical evidence of inventories and hosts that only existed briefly.
+
+### Recommended Controller Monitoring Workflow
+
+1. Run `sync` once to backfill existing controller jobs.
+2. Run `monitor` continuously or on a very short interval.
+3. Run `report --source jobs --days 30|60|90`.
+
+Initial backfill of the last 90 days from all inventories on the controller:
+
+```bash
+export CONTROLLER_OAUTH_TOKEN='...'
+
+python3 node_counter.py sync \
+  --controller-url 'https://controller.example.com' \
+  --state-db /var/lib/node-counter/node_counter_state.db \
+  --days-back 90
+```
+
+Continuous monitoring of all controller jobs across all inventories:
+
+```bash
+python3 node_counter.py monitor \
+  --controller-url 'https://controller.example.com' \
+  --state-db /var/lib/node-counter/node_counter_state.db \
+  --interval-seconds 60
+```
+
+30-day report from harvested jobs:
+
+```bash
+python3 node_counter.py report \
+  --state-db /var/lib/node-counter/node_counter_state.db \
+  --source jobs \
+  --days 30 \
+  --list
+```
+
+90-day report for one controller scope when a shared database is used:
+
+```bash
+python3 node_counter.py report \
+  --state-db /var/lib/node-counter/node_counter_state.db \
+  --source jobs \
+  --controller-url 'https://controller.example.com' \
+  --days 90 \
+  --format json
+```
+
+### Snapshot Monitoring Workflow
+
+The snapshot workflow is:
 
 1. Run `capture` on a schedule.
 2. Store the SQLite database on persistent storage.
@@ -133,6 +196,7 @@ Report on the last 30 days:
 ```bash
 python3 node_counter.py report \
   --state-db /var/lib/node-counter/node_counter_state.db \
+  --source snapshots \
   --days 30 \
   --list
 ```
@@ -142,6 +206,7 @@ Report JSON for the last 90 days:
 ```bash
 python3 node_counter.py report \
   --state-db /var/lib/node-counter/node_counter_state.db \
+  --source snapshots \
   --days 90 \
   --format json
 ```
@@ -150,25 +215,29 @@ python3 node_counter.py report \
 
 For most environments:
 
-- run `capture` once per day for standard estate monitoring
-- run `capture` hourly if inventories rotate frequently or ephemeral assets appear briefly
+- run `sync` once for historical backfill
+- run `monitor` every 30 to 60 seconds for controller-based historical tracking
+- run `capture` once per day only when you specifically need inventory-state snapshots
 - place the SQLite file on persistent storage, not in an ephemeral execution environment filesystem
 
 This maps well to an AAP scheduled job template or to `cron`.
 
 ### What the 30/60/90 Day Report Means
 
-The `report` command returns the number of unique deduplicated nodes that appeared in at least one capture during the requested lookback window.
+For job-based reports, the `report` command returns the number of unique deduplicated nodes that appeared in at least one harvested job during the requested lookback window.
+
+For snapshot-based reports, it returns the number of unique deduplicated nodes that appeared in at least one snapshot during the requested lookback window.
 
 That helps with:
 
 - rotating inventories
 - duplicate hostnames across inventories
 - longer-horizon estate visibility
+- inventories created on the fly and deleted after a job completes
 
-It does not infer assets that were never present in any capture.
+It does not infer assets that were never present in any harvested job or snapshot.
 
-Very short-lived assets can still be missed if they appear and disappear between captures, so the capture frequency matters.
+Very short-lived assets can still be missed if controller job records are cleaned up before the monitor harvests them, so the monitor interval matters.
 
 ## Controller Mode
 
@@ -230,10 +299,10 @@ That keeps both objects countable without fact gathering even though they share 
 `report` text output shows:
 
 - requested 30/60/90-day window
-- snapshots considered
+- jobs or snapshots considered
 - total unique nodes observed in that window
 - whether the database currently covers the full requested window
-- an optional readable list with first observed, last observed, and snapshots observed
+- an optional readable list with first observed, last observed, and jobs observed or snapshots observed
 
 JSON output is available for all commands:
 
@@ -245,10 +314,12 @@ python3 node_counter.py count -i inventories/prod/hosts.yml --format json
 
 - This is intentionally inventory-driven. If a node is not represented in inventory or controller data, it cannot be counted.
 - Multi-day monitoring depends on recurring captures. If you only start collecting today, the database will not immediately contain a full 90-day history.
+- Job-based monitoring depends on controller job retention lasting long enough for the harvester to ingest the job history. A shorter polling interval reduces that risk.
 - Smart inventory and controller-host variable inheritance can still depend on how the environment is modeled.
 - DNS-based deduplication is optional because name resolution policies vary by environment.
 - Indirect or API-managed objects still need stable inventory modeling. If several objects share one API endpoint, use a canonical variable such as `node_count_id`.
 - If your execution environment is ephemeral, store the SQLite database on a mounted persistent path.
+- The utility can reliably preserve hosts used by transient inventories once it has harvested the finished job. It cannot generically infer every downstream cloud resource or API object touched inside a playbook unless those resources are represented as distinct inventory identities or emitted through explicit instrumentation.
 
 ## Testing
 

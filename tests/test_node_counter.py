@@ -159,7 +159,7 @@ class NodeCounterTests(unittest.TestCase):
             )
 
             with mock.patch("node_counter.utc_now", return_value=node_counter.datetime(2026, 1, 20, tzinfo=node_counter.timezone.utc)):
-                window_report = node_counter.build_window_report(db_path=db_path, days=30)
+                window_report = node_counter.build_snapshot_window_report(db_path=db_path, days=30)
 
         self.assertEqual(window_report["total_unique_nodes"], 1)
         self.assertEqual(window_report["snapshots_considered"], 2)
@@ -196,9 +196,115 @@ class NodeCounterTests(unittest.TestCase):
             )
 
             with mock.patch("node_counter.utc_now", return_value=node_counter.datetime(2026, 3, 1, tzinfo=node_counter.timezone.utc)):
-                window_report = node_counter.build_window_report(db_path=db_path, days=60)
+                window_report = node_counter.build_snapshot_window_report(db_path=db_path, days=60)
 
         self.assertFalse(window_report["coverage"]["full_window_covered"])
+
+    def test_job_window_report_tracks_deleted_inventory_history_locally(self):
+        node = node_counter.UniqueNode(identity="192.0.2.10", identity_source="var:ansible_host")
+        node.aliases.update({"ephemeral-host"})
+        node.inventories.update({"tmp-inventory"})
+        node.sources.update({"tmp-inventory (job_id=42, job_name=ephemeral-run)"})
+
+        job = {
+            "id": 42,
+            "name": "ephemeral-run",
+            "finished": "2026-01-12T12:00:00+00:00",
+            "started": "2026-01-12T11:58:00+00:00",
+            "status": "successful",
+            "type": "job",
+            "summary_fields": {
+                "inventory": {"id": 7001, "name": "tmp-inventory"},
+                "organization": {"name": "Default"},
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = f"{temp_dir}/state.db"
+            node_counter.save_job_observation(
+                db_path=db_path,
+                controller_key="https://controller.example.com",
+                job=job,
+                nodes=[node],
+            )
+
+            with mock.patch("node_counter.utc_now", return_value=node_counter.datetime(2026, 1, 20, tzinfo=node_counter.timezone.utc)):
+                window_report = node_counter.build_job_window_report(
+                    db_path=db_path,
+                    days=30,
+                    controller_key="https://controller.example.com",
+                )
+
+        self.assertEqual(window_report["total_unique_nodes"], 1)
+        self.assertEqual(window_report["jobs_considered"], 1)
+        self.assertEqual(window_report["nodes"][0]["jobs_observed"], 1)
+        self.assertEqual(window_report["nodes"][0]["inventories"], ["tmp-inventory"])
+
+    def test_best_window_report_prefers_jobs_when_present(self):
+        snapshot_report = {
+            "mode": "inventory",
+            "total_source_records": 1,
+            "total_unique_nodes": 1,
+            "deduplicated_records": 0,
+            "nodes": [
+                {
+                    "identity": "snapshot-only",
+                    "identity_source": "inventory_hostname",
+                    "display_name": "snapshot-only",
+                    "aliases": ["snapshot-only"],
+                    "inventories": ["snapshots"],
+                    "sources": ["snapshots"],
+                    "source_record_count": 1,
+                }
+            ],
+        }
+        node = node_counter.UniqueNode(identity="job-node", identity_source="inventory_hostname")
+        node.aliases.update({"job-node"})
+        node.inventories.update({"jobs"})
+        node.sources.update({"jobs"})
+        job = {
+            "id": 99,
+            "name": "job-source",
+            "finished": "2026-01-10T12:00:00+00:00",
+            "started": "2026-01-10T11:59:00+00:00",
+            "status": "successful",
+            "type": "job",
+            "summary_fields": {
+                "inventory": {"id": 9, "name": "jobs"},
+                "organization": {"name": "Default"},
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = f"{temp_dir}/state.db"
+            node_counter.save_snapshot(
+                db_path=db_path,
+                captured_at="2026-01-09T00:00:00+00:00",
+                report=snapshot_report,
+                scope={"inventories": ["inventory.yml"]},
+            )
+            node_counter.save_job_observation(
+                db_path=db_path,
+                controller_key="https://controller.example.com",
+                job=job,
+                nodes=[node],
+            )
+
+            with mock.patch("node_counter.utc_now", return_value=node_counter.datetime(2026, 1, 20, tzinfo=node_counter.timezone.utc)):
+                window_report = node_counter.build_best_window_report(
+                    db_path=db_path,
+                    days=30,
+                    source="auto",
+                )
+
+        self.assertEqual(window_report["data_source"], "jobs")
+        self.assertEqual(window_report["total_unique_nodes"], 1)
+
+    def test_normalize_controller_scope_key_strips_api_suffix(self):
+        self.assertEqual(
+            node_counter.normalize_controller_scope_key("https://controller.example.com/api/controller/v2/"),
+            "https://controller.example.com",
+        )
 
 
 if __name__ == "__main__":

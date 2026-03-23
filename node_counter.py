@@ -24,6 +24,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -88,7 +89,7 @@ class UniqueNode:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    commands = {"count", "capture", "report"}
+    commands = {"count", "capture", "sync", "monitor", "report"}
     if argv and argv[0] not in commands and argv[0] not in {"-h", "--help"}:
         argv = ["count", *argv]
 
@@ -122,6 +123,92 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Override the capture timestamp in ISO-8601 UTC form. Intended for testing.",
     )
 
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="Harvest finished controller jobs into the local state database.",
+    )
+    add_controller_mode_arguments(sync_parser)
+    add_identity_arguments(sync_parser)
+    sync_parser.add_argument(
+        "--state-db",
+        default=DEFAULT_STATE_DB,
+        help=f"SQLite database used to store captures. Default: {DEFAULT_STATE_DB}",
+    )
+    sync_parser.add_argument(
+        "--days-back",
+        type=int,
+        default=90,
+        help="Initial backfill window in days when no prior job history exists locally.",
+    )
+    sync_parser.add_argument(
+        "--lookback-minutes",
+        type=int,
+        default=10,
+        help="Overlap window in minutes used on incremental syncs to avoid missing jobs.",
+    )
+    sync_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=200,
+        help="Controller page size for job and host summary harvests.",
+    )
+    sync_parser.add_argument(
+        "--start-at",
+        help="Override the job harvest start time in ISO-8601 UTC form.",
+    )
+    sync_parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format.",
+    )
+
+    monitor_parser = subparsers.add_parser(
+        "monitor",
+        help="Continuously harvest controller jobs into the local state database.",
+    )
+    add_controller_mode_arguments(monitor_parser)
+    add_identity_arguments(monitor_parser)
+    monitor_parser.add_argument(
+        "--state-db",
+        default=DEFAULT_STATE_DB,
+        help=f"SQLite database used to store captures. Default: {DEFAULT_STATE_DB}",
+    )
+    monitor_parser.add_argument(
+        "--days-back",
+        type=int,
+        default=90,
+        help="Initial backfill window in days when no prior job history exists locally.",
+    )
+    monitor_parser.add_argument(
+        "--lookback-minutes",
+        type=int,
+        default=10,
+        help="Overlap window in minutes used on incremental syncs to avoid missing jobs.",
+    )
+    monitor_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=200,
+        help="Controller page size for job and host summary harvests.",
+    )
+    monitor_parser.add_argument(
+        "--start-at",
+        help="Override the job harvest start time in ISO-8601 UTC form.",
+    )
+    monitor_parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=60,
+        help="Polling interval for continuous controller monitoring.",
+    )
+    monitor_parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format for cycle summaries.",
+    )
+
     report_parser = subparsers.add_parser(
         "report",
         help="Report unique nodes observed in the last N days from stored captures.",
@@ -136,6 +223,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=30,
         help="Lookback window in days. Typical values are 30, 60, or 90.",
+    )
+    report_parser.add_argument(
+        "--source",
+        choices=("auto", "jobs", "snapshots"),
+        default="auto",
+        help="Data source to report from. 'auto' prefers harvested jobs when available.",
+    )
+    report_parser.add_argument(
+        "--controller-url",
+        help="Optional controller URL filter for job-based reports when one database stores multiple controllers.",
     )
     report_parser.add_argument(
         "--format",
@@ -221,6 +318,46 @@ def add_source_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_controller_mode_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--controller-url",
+        required=True,
+        help="Automation Controller base URL, such as https://controller.example.com",
+    )
+    parser.add_argument(
+        "--inventory-id",
+        type=int,
+        action="append",
+        default=[],
+        metavar="ID",
+        help="Controller inventory ID to include. Repeat as needed. Defaults to all inventories.",
+    )
+    parser.add_argument(
+        "--inventory-name",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Controller inventory name to include. Repeat as needed. Defaults to all inventories.",
+    )
+    parser.add_argument(
+        "--token",
+        help="Controller OAuth token. Defaults to CONTROLLER_OAUTH_TOKEN or TOWER_OAUTH_TOKEN.",
+    )
+    parser.add_argument(
+        "--username",
+        help="Controller username for basic auth.",
+    )
+    parser.add_argument(
+        "--password",
+        help="Controller password for basic auth.",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Skip TLS certificate verification for controller API calls.",
+    )
+
+
 def add_identity_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--identity-var",
@@ -263,6 +400,10 @@ def main(argv: list[str] | None = None) -> int:
             return run_count_command(args)
         if args.command == "capture":
             return run_capture_command(args)
+        if args.command == "sync":
+            return run_sync_command(args)
+        if args.command == "monitor":
+            return run_monitor_command(args)
         if args.command == "report":
             return run_report_command(args)
         raise NodeCounterError(f"unsupported command: {args.command}")
@@ -335,13 +476,44 @@ def run_capture_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_sync_command(args: argparse.Namespace) -> int:
+    sync_report = sync_controller_history(args)
+    if args.format == "json":
+        print(json.dumps(sync_report, indent=2, sort_keys=True))
+    else:
+        render_sync_report(sync_report)
+    return 0
+
+
+def run_monitor_command(args: argparse.Namespace) -> int:
+    if args.interval_seconds <= 0:
+        raise NodeCounterError("--interval-seconds must be greater than zero")
+
+    cycle = 0
+    try:
+        while True:
+            cycle += 1
+            sync_report = sync_controller_history(args)
+            sync_report["cycle"] = cycle
+            if args.format == "json":
+                print(json.dumps(sync_report, indent=2, sort_keys=True))
+            else:
+                render_sync_report(sync_report)
+            time.sleep(args.interval_seconds)
+    except KeyboardInterrupt:
+        return 0
+
+
 def run_report_command(args: argparse.Namespace) -> int:
     if args.days <= 0:
         raise NodeCounterError("--days must be greater than zero")
 
-    report = build_window_report(
+    controller_key = normalize_controller_scope_key(args.controller_url) if args.controller_url else None
+    report = build_best_window_report(
         db_path=args.state_db,
         days=args.days,
+        source=args.source,
+        controller_key=controller_key,
     )
 
     if args.format == "json":
@@ -417,6 +589,393 @@ def build_scope_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "playbook_dir": args.playbook_dir,
         "ansible_inventory_args": list(args.ansible_inventory_arg),
     }
+
+
+def normalize_controller_scope_key(value: str) -> str:
+    cleaned = value.rstrip("/")
+    parsed = parse.urlparse(cleaned)
+    path = parsed.path.rstrip("/")
+    for suffix in ("/api/controller/v2", "/api/v2"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    normalized = parse.urlunparse(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            path.rstrip("/"),
+            "",
+            "",
+            "",
+        )
+    )
+    return normalized.rstrip("/")
+
+
+def sync_controller_history(args: argparse.Namespace) -> dict[str, Any]:
+    if args.days_back <= 0:
+        raise NodeCounterError("--days-back must be greater than zero")
+    if args.lookback_minutes < 0:
+        raise NodeCounterError("--lookback-minutes must be zero or greater")
+    if args.batch_size <= 0:
+        raise NodeCounterError("--batch-size must be greater than zero")
+
+    client = ControllerClient.from_args(args)
+    controller_key = normalize_controller_scope_key(args.controller_url)
+    start_at = determine_job_sync_start(
+        db_path=args.state_db,
+        controller_key=controller_key,
+        days_back=args.days_back,
+        lookback_minutes=args.lookback_minutes,
+        explicit_start=args.start_at,
+    )
+
+    job_rows = fetch_finished_jobs_since(
+        client=client,
+        start_at=start_at,
+        batch_size=args.batch_size,
+    )
+
+    new_jobs = 0
+    new_nodes = 0
+    skipped_jobs = 0
+    host_cache: dict[int, dict[str, Any] | None] = {}
+    identity_vars = unique_preserving_order(tuple(args.identity_var) + DEFAULT_IDENTITY_VARS)
+
+    candidate_jobs = [
+        job
+        for job in job_rows
+        if job_matches_inventory_filters(job, args) and int(job.get("id", 0)) > 0
+    ]
+    processed_job_ids = [int(job.get("id", 0)) for job in candidate_jobs]
+    existing_job_ids = get_observed_job_ids(args.state_db, controller_key, processed_job_ids)
+
+    for job in candidate_jobs:
+        job_id = int(job.get("id", 0))
+        if job_id in existing_job_ids:
+            skipped_jobs += 1
+            continue
+
+        records = load_hosts_from_job(
+            client=client,
+            job=job,
+            batch_size=args.batch_size,
+            host_cache=host_cache,
+        )
+        nodes = deduplicate_hosts(
+            records,
+            identity_vars=identity_vars,
+            resolve_dns=args.resolve_dns,
+            port_aware=args.port_aware,
+        )
+        save_job_observation(
+            db_path=args.state_db,
+            controller_key=controller_key,
+            job=job,
+            nodes=nodes,
+        )
+        new_jobs += 1
+        new_nodes += len(nodes)
+
+    return {
+        "mode": "job-sync",
+        "controller_key": controller_key,
+        "controller_url": args.controller_url,
+        "state_db": str(Path(args.state_db)),
+        "start_at": start_at,
+        "jobs_fetched": len(job_rows),
+        "jobs_processed": new_jobs,
+        "jobs_skipped_existing": skipped_jobs,
+        "nodes_recorded": new_nodes,
+        "job_ids_seen": processed_job_ids,
+    }
+
+
+def determine_job_sync_start(
+    db_path: str,
+    controller_key: str,
+    days_back: int,
+    lookback_minutes: int,
+    explicit_start: str | None,
+) -> str:
+    if explicit_start:
+        return parse_capture_time(explicit_start)
+
+    last_finished_at = get_last_observed_job_time(db_path, controller_key)
+    if last_finished_at:
+        try:
+            parsed = datetime.fromisoformat(last_finished_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise NodeCounterError(
+                f"invalid stored job timestamp in state DB: {last_finished_at}"
+            ) from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        return (parsed - timedelta(minutes=lookback_minutes)).replace(microsecond=0).isoformat()
+
+    return (utc_now() - timedelta(days=days_back)).replace(microsecond=0).isoformat()
+
+
+def fetch_finished_jobs_since(
+    client: "ControllerClient",
+    start_at: str,
+    batch_size: int,
+) -> list[dict[str, Any]]:
+    query = parse.urlencode(
+        {
+            "page_size": batch_size,
+            "order_by": "finished",
+            "finished__gte": start_at,
+            "finished__isnull": "False",
+        }
+    )
+    return client.get_paginated(f"jobs/?{query}")
+
+
+def job_matches_inventory_filters(job: Mapping[str, Any], args: argparse.Namespace) -> bool:
+    if not args.inventory_id and not args.inventory_name:
+        return True
+
+    summary_fields = job.get("summary_fields", {})
+    inventory = summary_fields.get("inventory", {}) if isinstance(summary_fields, Mapping) else {}
+    inventory_id = inventory.get("id") if isinstance(inventory, Mapping) else None
+    inventory_name = inventory.get("name") if isinstance(inventory, Mapping) else None
+
+    if args.inventory_id and inventory_id not in set(args.inventory_id):
+        return False
+    if args.inventory_name and inventory_name not in set(args.inventory_name):
+        return False
+    return True
+
+
+def get_last_observed_job_time(db_path: str, controller_key: str) -> str | None:
+    connection = open_state_db(db_path)
+    try:
+        row = connection.execute(
+            """
+            SELECT MAX(finished_at) AS last_finished_at
+            FROM observed_jobs
+            WHERE controller_key = ?
+            """,
+            (controller_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["last_finished_at"]
+    finally:
+        connection.close()
+
+
+def get_observed_job_ids(db_path: str, controller_key: str, job_ids: list[int]) -> set[int]:
+    if not job_ids:
+        return set()
+
+    connection = open_state_db(db_path)
+    try:
+        placeholders = ", ".join("?" for _ in job_ids)
+        rows = connection.execute(
+            """
+            SELECT job_id
+            FROM observed_jobs
+            WHERE controller_key = ?
+              AND job_id IN (""" + placeholders + """)
+            """,
+            [controller_key, *job_ids],
+        ).fetchall()
+        return {int(row["job_id"]) for row in rows}
+    finally:
+        connection.close()
+
+
+def load_hosts_from_job(
+    client: "ControllerClient",
+    job: Mapping[str, Any],
+    batch_size: int,
+    host_cache: dict[int, dict[str, Any] | None],
+) -> list[HostRecord]:
+    job_id = int(job.get("id", 0))
+    inventory_name = job_inventory_name(job)
+    job_name = str(job.get("name", f"job-{job_id}"))
+    endpoint = f"jobs/{job_id}/job_host_summaries/?page_size={batch_size}"
+    summaries = client.get_paginated(endpoint)
+
+    records: list[HostRecord] = []
+    for summary in summaries:
+        record = build_host_record_from_summary(
+            client=client,
+            job=job,
+            summary=summary,
+            default_inventory_name=inventory_name,
+            source_label=f"{inventory_name} (job_id={job_id}, job_name={job_name})",
+            host_cache=host_cache,
+        )
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def build_host_record_from_summary(
+    client: "ControllerClient",
+    job: Mapping[str, Any],
+    summary: Mapping[str, Any],
+    default_inventory_name: str,
+    source_label: str,
+    host_cache: dict[int, dict[str, Any] | None],
+) -> HostRecord | None:
+    summary_fields = summary.get("summary_fields", {})
+    summary_host = summary_fields.get("host", {}) if isinstance(summary_fields, Mapping) else {}
+    host_name = str(
+        summary.get("host_name")
+        or (summary_host.get("name") if isinstance(summary_host, Mapping) else "")
+        or ""
+    ).strip()
+    host_id = summary.get("host") or (summary_host.get("id") if isinstance(summary_host, Mapping) else None)
+    inventory_name = default_inventory_name
+    variables: dict[str, Any] = {}
+
+    if isinstance(host_id, int) and host_id > 0:
+        if host_id in host_cache:
+            host_detail = host_cache[host_id]
+        else:
+            host_detail = fetch_host_detail(client, host_id)
+            host_cache[host_id] = host_detail
+        if host_detail:
+            host_name = str(host_detail.get("name") or host_name).strip()
+            variables = parse_mapping(host_detail.get("variables"))
+            inventory_name = host_inventory_name(host_detail) or inventory_name
+
+    if not host_name:
+        host_name = str(job.get("id", "unknown-host"))
+    if not inventory_name:
+        inventory_name = default_inventory_name or "unknown-inventory"
+
+    return HostRecord(
+        name=host_name,
+        inventory=inventory_name,
+        source=source_label,
+        variables=variables,
+        enabled=True,
+    )
+
+
+def fetch_host_detail(client: "ControllerClient", host_id: int) -> dict[str, Any] | None:
+    try:
+        payload = client.get_json(f"hosts/{host_id}/")
+    except NodeCounterError as exc:
+        if "404" in str(exc):
+            return None
+        raise
+    return payload if isinstance(payload, dict) else None
+
+
+def job_inventory_name(job: Mapping[str, Any]) -> str:
+    summary_fields = job.get("summary_fields", {})
+    if isinstance(summary_fields, Mapping):
+        inventory = summary_fields.get("inventory", {})
+        if isinstance(inventory, Mapping):
+            name = str(inventory.get("name") or "").strip()
+            if name:
+                return name
+    return "unknown-inventory"
+
+
+def host_inventory_name(host_detail: Mapping[str, Any]) -> str:
+    summary_fields = host_detail.get("summary_fields", {})
+    if isinstance(summary_fields, Mapping):
+        inventory = summary_fields.get("inventory", {})
+        if isinstance(inventory, Mapping):
+            name = str(inventory.get("name") or "").strip()
+            if name:
+                return name
+    return ""
+
+
+def save_job_observation(
+    db_path: str,
+    controller_key: str,
+    job: Mapping[str, Any],
+    nodes: list[UniqueNode],
+) -> None:
+    job_id = int(job.get("id", 0))
+    finished_at = str(job.get("finished") or "")
+    if not finished_at:
+        raise NodeCounterError(f"job {job_id} has no finished timestamp")
+
+    summary_fields = job.get("summary_fields", {})
+    inventory = summary_fields.get("inventory", {}) if isinstance(summary_fields, Mapping) else {}
+    organization = summary_fields.get("organization", {}) if isinstance(summary_fields, Mapping) else {}
+
+    connection = open_state_db(db_path)
+    try:
+        with connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO observed_jobs (
+                    controller_key,
+                    job_id,
+                    finished_at,
+                    launched_at,
+                    job_name,
+                    job_status,
+                    inventory_id,
+                    inventory_name,
+                    organization_name,
+                    job_type,
+                    raw_summary_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    controller_key,
+                    job_id,
+                    finished_at,
+                    str(job.get("started") or ""),
+                    str(job.get("name") or f"job-{job_id}"),
+                    str(job.get("status") or ""),
+                    int(inventory.get("id")) if isinstance(inventory, Mapping) and inventory.get("id") else None,
+                    str(inventory.get("name") or "") if isinstance(inventory, Mapping) else "",
+                    str(organization.get("name") or "") if isinstance(organization, Mapping) else "",
+                    str(job.get("type") or "job"),
+                    json.dumps(job, sort_keys=True),
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM observed_job_nodes
+                WHERE controller_key = ? AND job_id = ?
+                """,
+                (controller_key, job_id),
+            )
+            for node in nodes:
+                connection.execute(
+                    """
+                    INSERT INTO observed_job_nodes (
+                        controller_key,
+                        job_id,
+                        identity,
+                        identity_source,
+                        display_name,
+                        aliases_json,
+                        inventories_json,
+                        sources_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        controller_key,
+                        job_id,
+                        node.identity,
+                        node.identity_source,
+                        node.display_name,
+                        json.dumps(sorted(node.aliases), sort_keys=True),
+                        json.dumps(sorted(node.inventories), sort_keys=True),
+                        json.dumps(sorted(node.sources), sort_keys=True),
+                    ),
+                )
+    finally:
+        connection.close()
 
 
 def load_hosts_from_inventories(args: argparse.Namespace) -> list[HostRecord]:
@@ -898,6 +1457,42 @@ def initialize_state_db(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_snapshot_nodes_identity
         ON snapshot_nodes (identity);
+
+        CREATE TABLE IF NOT EXISTS observed_jobs (
+            controller_key TEXT NOT NULL,
+            job_id INTEGER NOT NULL,
+            finished_at TEXT NOT NULL,
+            launched_at TEXT,
+            job_name TEXT NOT NULL,
+            job_status TEXT,
+            inventory_id INTEGER,
+            inventory_name TEXT,
+            organization_name TEXT,
+            job_type TEXT NOT NULL,
+            raw_summary_json TEXT NOT NULL,
+            PRIMARY KEY (controller_key, job_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS observed_job_nodes (
+            controller_key TEXT NOT NULL,
+            job_id INTEGER NOT NULL,
+            identity TEXT NOT NULL,
+            identity_source TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            aliases_json TEXT NOT NULL,
+            inventories_json TEXT NOT NULL,
+            sources_json TEXT NOT NULL,
+            PRIMARY KEY (controller_key, job_id, identity),
+            FOREIGN KEY (controller_key, job_id)
+                REFERENCES observed_jobs(controller_key, job_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_observed_jobs_finished_at
+        ON observed_jobs (controller_key, finished_at);
+
+        CREATE INDEX IF NOT EXISTS idx_observed_job_nodes_identity
+        ON observed_job_nodes (controller_key, identity);
         """
     )
 
@@ -958,7 +1553,7 @@ def save_snapshot(
         connection.close()
 
 
-def build_window_report(db_path: str, days: int) -> dict[str, Any]:
+def build_snapshot_window_report(db_path: str, days: int) -> dict[str, Any]:
     connection = open_state_db(db_path)
     cutoff_dt = utc_now() - timedelta(days=days)
     cutoff = cutoff_dt.isoformat()
@@ -989,7 +1584,7 @@ def build_window_report(db_path: str, days: int) -> dict[str, Any]:
 
         if not snapshot_rows:
             return {
-                "mode": "monitor-report",
+                "mode": "snapshot-report",
                 "state_db": str(Path(db_path)),
                 "window_days": days,
                 "requested_start": cutoff,
@@ -1066,7 +1661,7 @@ def build_window_report(db_path: str, days: int) -> dict[str, Any]:
             )
 
         return {
-            "mode": "monitor-report",
+            "mode": "snapshot-report",
             "state_db": str(Path(db_path)),
             "window_days": days,
             "requested_start": cutoff,
@@ -1083,6 +1678,167 @@ def build_window_report(db_path: str, days: int) -> dict[str, Any]:
         }
     finally:
         connection.close()
+
+
+def build_job_window_report(
+    db_path: str,
+    days: int,
+    controller_key: str | None = None,
+) -> dict[str, Any]:
+    connection = open_state_db(db_path)
+    cutoff_dt = utc_now() - timedelta(days=days)
+    cutoff = cutoff_dt.isoformat()
+
+    where_clauses = ["j.finished_at >= ?"]
+    params: list[Any] = [cutoff]
+    overall_where = ""
+    overall_params: list[Any] = []
+    if controller_key:
+        where_clauses.append("j.controller_key = ?")
+        params.append(controller_key)
+        overall_where = "WHERE controller_key = ?"
+        overall_params.append(controller_key)
+    where_sql = " AND ".join(where_clauses)
+
+    try:
+        overall = connection.execute(
+            f"""
+            SELECT COUNT(*) AS job_count,
+                   MIN(finished_at) AS first_job,
+                   MAX(finished_at) AS last_job
+            FROM observed_jobs
+            {overall_where}
+            """,
+            overall_params,
+        ).fetchone()
+        if overall is None or int(overall["job_count"]) == 0:
+            raise NodeCounterError(
+                f"no harvested job history was found in the state database: {Path(db_path)}"
+            )
+
+        rows = connection.execute(
+            f"""
+            SELECT j.controller_key,
+                   j.job_id,
+                   j.finished_at,
+                   j.job_name,
+                   j.inventory_name AS job_inventory_name,
+                   n.identity,
+                   n.identity_source,
+                   n.display_name,
+                   n.aliases_json,
+                   n.inventories_json,
+                   n.sources_json
+            FROM observed_jobs AS j
+            JOIN observed_job_nodes AS n
+              ON n.controller_key = j.controller_key
+             AND n.job_id = j.job_id
+            WHERE {where_sql}
+            ORDER BY j.finished_at ASC, j.job_id ASC, n.identity ASC
+            """,
+            params,
+        ).fetchall()
+
+        if not rows:
+            return {
+                "mode": "job-report",
+                "data_source": "jobs",
+                "state_db": str(Path(db_path)),
+                "controller_key": controller_key,
+                "window_days": days,
+                "requested_start": cutoff,
+                "requested_end": utc_now().isoformat(),
+                "jobs_considered": 0,
+                "total_unique_nodes": 0,
+                "total_observations": 0,
+                "coverage": {
+                    "first_capture": overall["first_job"],
+                    "last_capture": overall["last_job"],
+                    "full_window_covered": False,
+                },
+                "nodes": [],
+            }
+
+        aggregated: dict[str, dict[str, Any]] = {}
+        jobs_seen: set[tuple[str, int]] = set()
+        for row in rows:
+            jobs_seen.add((str(row["controller_key"]), int(row["job_id"])))
+            identity = str(row["identity"])
+            entry = aggregated.get(identity)
+            if entry is None:
+                entry = {
+                    "identity": identity,
+                    "identity_source": str(row["identity_source"]),
+                    "display_name": str(row["display_name"]),
+                    "aliases": set(),
+                    "inventories": set(),
+                    "sources": set(),
+                    "first_observed": str(row["finished_at"]),
+                    "last_observed": str(row["finished_at"]),
+                    "jobs_observed": set(),
+                }
+                aggregated[identity] = entry
+
+            entry["aliases"].update(parse_json_list(row["aliases_json"]))
+            entry["inventories"].update(parse_json_list(row["inventories_json"]))
+            entry["sources"].update(parse_json_list(row["sources_json"]))
+            entry["first_observed"] = min(entry["first_observed"], str(row["finished_at"]))
+            entry["last_observed"] = max(entry["last_observed"], str(row["finished_at"]))
+            entry["jobs_observed"].add(int(row["job_id"]))
+
+        nodes = []
+        for entry in sorted(aggregated.values(), key=lambda item: item["display_name"].lower()):
+            nodes.append(
+                {
+                    "identity": entry["identity"],
+                    "identity_source": entry["identity_source"],
+                    "display_name": entry["display_name"],
+                    "aliases": sorted(entry["aliases"]),
+                    "inventories": sorted(entry["inventories"]),
+                    "sources": sorted(entry["sources"]),
+                    "first_observed": entry["first_observed"],
+                    "last_observed": entry["last_observed"],
+                    "jobs_observed": len(entry["jobs_observed"]),
+                }
+            )
+
+        return {
+            "mode": "job-report",
+            "data_source": "jobs",
+            "state_db": str(Path(db_path)),
+            "controller_key": controller_key,
+            "window_days": days,
+            "requested_start": cutoff,
+            "requested_end": utc_now().isoformat(),
+            "jobs_considered": len(jobs_seen),
+            "total_unique_nodes": len(nodes),
+            "total_observations": len(rows),
+            "coverage": {
+                "first_capture": overall["first_job"],
+                "last_capture": overall["last_job"],
+                "full_window_covered": str(overall["first_job"]) <= cutoff,
+            },
+            "nodes": nodes,
+        }
+    finally:
+        connection.close()
+
+
+def build_best_window_report(
+    db_path: str,
+    days: int,
+    source: str,
+    controller_key: str | None = None,
+) -> dict[str, Any]:
+    if source == "jobs":
+        return build_job_window_report(db_path=db_path, days=days, controller_key=controller_key)
+    if source == "snapshots":
+        return build_snapshot_window_report(db_path=db_path, days=days)
+
+    try:
+        return build_job_window_report(db_path=db_path, days=days, controller_key=controller_key)
+    except NodeCounterError:
+        return build_snapshot_window_report(db_path=db_path, days=days)
 
 
 def parse_json_list(value: Any) -> list[str]:
@@ -1158,15 +1914,22 @@ def render_capture_report(
 def render_window_report(report: Mapping[str, Any], list_nodes: bool) -> None:
     coverage = report.get("coverage", {})
     print(f"Mode: {report['mode']}")
+    if report.get("data_source"):
+        print(f"Data source: {report['data_source']}")
     print(f"State database: {report['state_db']}")
+    if report.get("controller_key"):
+        print(f"Controller scope: {report['controller_key']}")
     print(f"Window: last {report['window_days']} days")
     print(f"Requested start: {report['requested_start']}")
     print(f"Requested end: {report['requested_end']}")
-    print(f"Snapshots considered: {report['snapshots_considered']}")
+    if "jobs_considered" in report:
+        print(f"Jobs considered: {report['jobs_considered']}")
+    else:
+        print(f"Snapshots considered: {report['snapshots_considered']}")
     print(f"Unique managed nodes observed: {report['total_unique_nodes']}")
     print(f"Observation rows considered: {report['total_observations']}")
-    print(f"Oldest capture in database: {coverage.get('first_capture')}")
-    print(f"Newest capture in database: {coverage.get('last_capture')}")
+    print(f"Oldest observation in database: {coverage.get('first_capture')}")
+    print(f"Newest observation in database: {coverage.get('last_capture')}")
     print(
         "Full requested window covered: "
         + ("yes" if coverage.get("full_window_covered") else "no")
@@ -1187,13 +1950,33 @@ def render_window_report(report: Mapping[str, Any], list_nodes: bool) -> None:
         print(
             f"{index}. {node.get('display_name')} "
             f"[{node.get('identity_source')}] "
-            f"(snapshots={node.get('snapshots_observed')})"
+            f"({node_observation_label(node)})"
         )
         print(f"   identity: {node.get('identity')}")
         print(f"   first observed: {node.get('first_observed')}")
         print(f"   last observed: {node.get('last_observed')}")
         print(f"   aliases: {aliases}")
         print(f"   inventories: {inventories}")
+
+
+def node_observation_label(node: Mapping[str, Any]) -> str:
+    if "jobs_observed" in node:
+        return f"jobs={node.get('jobs_observed')}"
+    return f"snapshots={node.get('snapshots_observed')}"
+
+
+def render_sync_report(report: Mapping[str, Any]) -> None:
+    cycle = report.get("cycle")
+    if cycle is not None:
+        print(f"Cycle: {cycle}")
+    print(f"Mode: {report['mode']}")
+    print(f"Controller scope: {report['controller_key']}")
+    print(f"State database: {report['state_db']}")
+    print(f"Harvest start: {report['start_at']}")
+    print(f"Jobs fetched: {report['jobs_fetched']}")
+    print(f"Jobs newly recorded: {report['jobs_processed']}")
+    print(f"Jobs already present: {report['jobs_skipped_existing']}")
+    print(f"Node observations recorded: {report['nodes_recorded']}")
 
 
 def env_first(*names: str) -> str | None:
