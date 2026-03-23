@@ -6,12 +6,7 @@
 - capturing recurring node snapshots from inventory or automation controller
 - reporting unique nodes observed over a rolling 30, 60, or 90 day window
 
-It was designed around the concerns captured in:
-
-- `Node Counting - State and Concerns.docx`
-- `Node Counting - Enablement.pptx`
-
-The design deliberately avoids the problems called out in those materials:
+The design deliberately avoids the problems below:
 
 - No fact gathering or fact caching is required.
 - No third-party Python packages are required beyond what normally ships with Python and Ansible.
