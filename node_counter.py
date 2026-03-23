@@ -162,6 +162,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="text",
         help="Output format.",
     )
+    sync_parser.add_argument(
+        "--harvest-event-identities",
+        action="store_true",
+        help="Inspect job events for explicit resource identity markers such as node_count_id.",
+    )
+    sync_parser.add_argument(
+        "--event-identity-var",
+        action="append",
+        default=[],
+        metavar="VAR",
+        help="Job event key to treat as an explicit managed-node identity. Repeat as needed.",
+    )
 
     monitor_parser = subparsers.add_parser(
         "monitor",
@@ -207,6 +219,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=("text", "json"),
         default="text",
         help="Output format for cycle summaries.",
+    )
+    monitor_parser.add_argument(
+        "--harvest-event-identities",
+        action="store_true",
+        help="Inspect job events for explicit resource identity markers such as node_count_id.",
+    )
+    monitor_parser.add_argument(
+        "--event-identity-var",
+        action="append",
+        default=[],
+        metavar="VAR",
+        help="Job event key to treat as an explicit managed-node identity. Repeat as needed.",
     )
 
     report_parser = subparsers.add_parser(
@@ -630,6 +654,11 @@ def sync_controller_history(args: argparse.Namespace) -> dict[str, Any]:
 
     client = ControllerClient.from_args(args)
     controller_key = normalize_controller_scope_key(args.controller_url)
+    active_snapshot_report = snapshot_active_job_hosts(
+        args=args,
+        client=client,
+        controller_key=controller_key,
+    )
     start_at = determine_job_sync_start(
         db_path=args.state_db,
         controller_key=controller_key,
@@ -649,6 +678,9 @@ def sync_controller_history(args: argparse.Namespace) -> dict[str, Any]:
     skipped_jobs = 0
     host_cache: dict[int, dict[str, Any] | None] = {}
     identity_vars = unique_preserving_order(tuple(args.identity_var) + DEFAULT_IDENTITY_VARS)
+    event_identity_vars = unique_preserving_order(
+        tuple(args.event_identity_var) + DEFAULT_IDENTITY_VARS
+    )
 
     candidate_jobs = [
         job
@@ -664,12 +696,43 @@ def sync_controller_history(args: argparse.Namespace) -> dict[str, Any]:
             skipped_jobs += 1
             continue
 
+        provisional_hosts = load_live_job_host_snapshots(
+            db_path=args.state_db,
+            controller_key=controller_key,
+            job_id=job_id,
+        )
+
         records = load_hosts_from_job(
             client=client,
             job=job,
             batch_size=args.batch_size,
             host_cache=host_cache,
+            provisional_hosts=provisional_hosts,
         )
+        if args.harvest_event_identities:
+            records.extend(
+                load_event_identity_records(
+                    client=client,
+                    job=job,
+                    batch_size=args.batch_size,
+                    event_identity_vars=event_identity_vars,
+                )
+            )
+
+        if not records:
+            save_job_observation(
+                db_path=args.state_db,
+                controller_key=controller_key,
+                job=job,
+                nodes=[],
+            )
+            delete_live_job_host_snapshots(
+                db_path=args.state_db,
+                controller_key=controller_key,
+                job_id=job_id,
+            )
+            new_jobs += 1
+            continue
         nodes = deduplicate_hosts(
             records,
             identity_vars=identity_vars,
@@ -681,6 +744,11 @@ def sync_controller_history(args: argparse.Namespace) -> dict[str, Any]:
             controller_key=controller_key,
             job=job,
             nodes=nodes,
+        )
+        delete_live_job_host_snapshots(
+            db_path=args.state_db,
+            controller_key=controller_key,
+            job_id=job_id,
         )
         new_jobs += 1
         new_nodes += len(nodes)
@@ -696,6 +764,9 @@ def sync_controller_history(args: argparse.Namespace) -> dict[str, Any]:
         "jobs_skipped_existing": skipped_jobs,
         "nodes_recorded": new_nodes,
         "job_ids_seen": processed_job_ids,
+        "active_jobs_seen": active_snapshot_report["active_jobs_seen"],
+        "active_job_snapshots_created": active_snapshot_report["snapshots_created"],
+        "active_job_host_rows_captured": active_snapshot_report["host_rows_captured"],
     }
 
 
@@ -797,11 +868,192 @@ def get_observed_job_ids(db_path: str, controller_key: str, job_ids: list[int]) 
         connection.close()
 
 
+def snapshot_active_job_hosts(
+    args: argparse.Namespace,
+    client: "ControllerClient",
+    controller_key: str,
+) -> dict[str, int]:
+    active_jobs = fetch_active_jobs(client=client, batch_size=args.batch_size)
+    candidate_jobs = [
+        job
+        for job in active_jobs
+        if job_matches_inventory_filters(job, args) and int(job.get("id", 0)) > 0
+    ]
+    job_ids = [int(job.get("id", 0)) for job in candidate_jobs]
+    existing_snapshot_jobs = get_live_job_snapshot_ids(args.state_db, controller_key, job_ids)
+
+    snapshots_created = 0
+    host_rows_captured = 0
+    for job in candidate_jobs:
+        job_id = int(job.get("id", 0))
+        if job_id in existing_snapshot_jobs:
+            continue
+        inventory_id = job_inventory_id(job)
+        if inventory_id is None:
+            continue
+
+        inventory_name = job_inventory_name(job)
+        host_rows = client.get_paginated(f"inventories/{inventory_id}/hosts/?page_size={args.batch_size}")
+        host_snapshots = []
+        for host in host_rows:
+            host_name = str(host.get("name") or host.get("id") or "").strip()
+            if not host_name:
+                continue
+            host_snapshots.append(
+                {
+                    "host_id": int(host.get("id")) if host.get("id") else None,
+                    "host_name": host_name,
+                    "inventory_name": inventory_name,
+                    "variables_json": json.dumps(parse_mapping(host.get("variables")), sort_keys=True),
+                }
+            )
+        if host_snapshots:
+            save_live_job_host_snapshots(
+                db_path=args.state_db,
+                controller_key=controller_key,
+                job_id=job_id,
+                host_snapshots=host_snapshots,
+            )
+            snapshots_created += 1
+            host_rows_captured += len(host_snapshots)
+
+    return {
+        "active_jobs_seen": len(candidate_jobs),
+        "snapshots_created": snapshots_created,
+        "host_rows_captured": host_rows_captured,
+    }
+
+
+def fetch_active_jobs(client: "ControllerClient", batch_size: int) -> list[dict[str, Any]]:
+    statuses = ("pending", "waiting", "running")
+    jobs_by_id: dict[int, dict[str, Any]] = {}
+    for status in statuses:
+        query = parse.urlencode(
+            {
+                "page_size": batch_size,
+                "status": status,
+            }
+        )
+        for job in client.get_paginated(f"jobs/?{query}"):
+            job_id = int(job.get("id", 0))
+            if job_id > 0:
+                jobs_by_id[job_id] = job
+    return [jobs_by_id[job_id] for job_id in sorted(jobs_by_id)]
+
+
+def get_live_job_snapshot_ids(db_path: str, controller_key: str, job_ids: list[int]) -> set[int]:
+    if not job_ids:
+        return set()
+
+    connection = open_state_db(db_path)
+    try:
+        placeholders = ", ".join("?" for _ in job_ids)
+        rows = connection.execute(
+            """
+            SELECT DISTINCT job_id
+            FROM live_job_hosts
+            WHERE controller_key = ?
+              AND job_id IN (""" + placeholders + """)
+            """,
+            [controller_key, *job_ids],
+        ).fetchall()
+        return {int(row["job_id"]) for row in rows}
+    finally:
+        connection.close()
+
+
+def save_live_job_host_snapshots(
+    db_path: str,
+    controller_key: str,
+    job_id: int,
+    host_snapshots: list[dict[str, Any]],
+) -> None:
+    connection = open_state_db(db_path)
+    try:
+        with connection:
+            for item in host_snapshots:
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO live_job_hosts (
+                        controller_key,
+                        job_id,
+                        host_id,
+                        host_name,
+                        inventory_name,
+                        variables_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        controller_key,
+                        job_id,
+                        item.get("host_id"),
+                        str(item.get("host_name") or ""),
+                        str(item.get("inventory_name") or ""),
+                        str(item.get("variables_json") or "{}"),
+                    ),
+                )
+    finally:
+        connection.close()
+
+
+def load_live_job_host_snapshots(
+    db_path: str,
+    controller_key: str,
+    job_id: int,
+) -> dict[str, dict[str, Any]]:
+    connection = open_state_db(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT host_id, host_name, inventory_name, variables_json
+            FROM live_job_hosts
+            WHERE controller_key = ? AND job_id = ?
+            """,
+            (controller_key, job_id),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    snapshots_by_id: dict[str, dict[str, Any]] = {}
+    snapshots_by_name: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        item = {
+            "host_id": row["host_id"],
+            "host_name": str(row["host_name"]),
+            "inventory_name": str(row["inventory_name"]),
+            "variables": parse_mapping(row["variables_json"]),
+        }
+        if row["host_id"] is not None:
+            snapshots_by_id[str(row["host_id"])] = item
+        snapshots_by_name[normalize_scalar(str(row["host_name"]))] = item
+    return {
+        "by_id": snapshots_by_id,
+        "by_name": snapshots_by_name,
+    }
+
+
+def delete_live_job_host_snapshots(db_path: str, controller_key: str, job_id: int) -> None:
+    connection = open_state_db(db_path)
+    try:
+        with connection:
+            connection.execute(
+                """
+                DELETE FROM live_job_hosts
+                WHERE controller_key = ? AND job_id = ?
+                """,
+                (controller_key, job_id),
+            )
+    finally:
+        connection.close()
+
+
 def load_hosts_from_job(
     client: "ControllerClient",
     job: Mapping[str, Any],
     batch_size: int,
     host_cache: dict[int, dict[str, Any] | None],
+    provisional_hosts: Mapping[str, Mapping[str, dict[str, Any]]],
 ) -> list[HostRecord]:
     job_id = int(job.get("id", 0))
     inventory_name = job_inventory_name(job)
@@ -818,6 +1070,7 @@ def load_hosts_from_job(
             default_inventory_name=inventory_name,
             source_label=f"{inventory_name} (job_id={job_id}, job_name={job_name})",
             host_cache=host_cache,
+            provisional_hosts=provisional_hosts,
         )
         if record is not None:
             records.append(record)
@@ -831,6 +1084,7 @@ def build_host_record_from_summary(
     default_inventory_name: str,
     source_label: str,
     host_cache: dict[int, dict[str, Any] | None],
+    provisional_hosts: Mapping[str, Mapping[str, dict[str, Any]]],
 ) -> HostRecord | None:
     summary_fields = summary.get("summary_fields", {})
     summary_host = summary_fields.get("host", {}) if isinstance(summary_fields, Mapping) else {}
@@ -853,6 +1107,17 @@ def build_host_record_from_summary(
             host_name = str(host_detail.get("name") or host_name).strip()
             variables = parse_mapping(host_detail.get("variables"))
             inventory_name = host_inventory_name(host_detail) or inventory_name
+
+    if not variables:
+        snapshot = None
+        if isinstance(host_id, int) and host_id > 0:
+            snapshot = provisional_hosts.get("by_id", {}).get(str(host_id))
+        if snapshot is None and host_name:
+            snapshot = provisional_hosts.get("by_name", {}).get(normalize_scalar(host_name))
+        if snapshot:
+            host_name = str(snapshot.get("host_name") or host_name).strip()
+            variables = dict(snapshot.get("variables", {}))
+            inventory_name = str(snapshot.get("inventory_name") or inventory_name)
 
     if not host_name:
         host_name = str(job.get("id", "unknown-host"))
@@ -889,6 +1154,15 @@ def job_inventory_name(job: Mapping[str, Any]) -> str:
     return "unknown-inventory"
 
 
+def job_inventory_id(job: Mapping[str, Any]) -> int | None:
+    summary_fields = job.get("summary_fields", {})
+    if isinstance(summary_fields, Mapping):
+        inventory = summary_fields.get("inventory", {})
+        if isinstance(inventory, Mapping) and inventory.get("id"):
+            return int(inventory.get("id"))
+    return None
+
+
 def host_inventory_name(host_detail: Mapping[str, Any]) -> str:
     summary_fields = host_detail.get("summary_fields", {})
     if isinstance(summary_fields, Mapping):
@@ -898,6 +1172,93 @@ def host_inventory_name(host_detail: Mapping[str, Any]) -> str:
             if name:
                 return name
     return ""
+
+
+def load_event_identity_records(
+    client: "ControllerClient",
+    job: Mapping[str, Any],
+    batch_size: int,
+    event_identity_vars: tuple[str, ...],
+) -> list[HostRecord]:
+    job_id = int(job.get("id", 0))
+    if job_id <= 0:
+        return []
+
+    inventory_name = job_inventory_name(job)
+    job_name = str(job.get("name", f"job-{job_id}"))
+    endpoint = f"jobs/{job_id}/job_events/?page_size={batch_size}"
+    events = client.get_paginated(endpoint)
+
+    plural_vars = {f"{name}s" for name in event_identity_vars}
+    records: list[HostRecord] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for event in events:
+        for identity_var, identity_value in extract_explicit_identities_from_event(
+            event=event,
+            scalar_keys=set(event_identity_vars),
+            list_keys=plural_vars,
+        ):
+            normalized = normalize_identity(identity_value)
+            if not normalized:
+                continue
+            dedupe_key = (identity_var, normalized)
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            records.append(
+                HostRecord(
+                    name=f"resource:{normalized}",
+                    inventory=inventory_name,
+                    source=f"{inventory_name} (job_id={job_id}, job_name={job_name}, event-identities)",
+                    variables={identity_var: normalized},
+                    enabled=True,
+                )
+            )
+    return records
+
+
+def extract_explicit_identities_from_event(
+    event: Mapping[str, Any],
+    scalar_keys: set[str],
+    list_keys: set[str],
+) -> list[tuple[str, str]]:
+    identities: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                if key in scalar_keys:
+                    for item in normalize_identity_values(nested):
+                        pair = (key, item)
+                        if pair not in seen:
+                            seen.add(pair)
+                            identities.append(pair)
+                elif key in list_keys:
+                    for item in normalize_identity_values(nested):
+                        pair = (key[:-1], item)
+                        if pair not in seen:
+                            seen.add(pair)
+                            identities.append(pair)
+                walk(nested)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(event.get("event_data", {}))
+    walk(event)
+    return identities
+
+
+def normalize_identity_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    return [text]
 
 
 def save_job_observation(
@@ -1508,6 +1869,19 @@ def initialize_state_db(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_observed_job_nodes_identity
         ON observed_job_nodes (controller_key, identity);
+
+        CREATE TABLE IF NOT EXISTS live_job_hosts (
+            controller_key TEXT NOT NULL,
+            job_id INTEGER NOT NULL,
+            host_id INTEGER,
+            host_name TEXT NOT NULL,
+            inventory_name TEXT NOT NULL,
+            variables_json TEXT NOT NULL,
+            PRIMARY KEY (controller_key, job_id, host_name)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_live_job_hosts_job
+        ON live_job_hosts (controller_key, job_id);
         """
     )
 
@@ -1988,6 +2362,9 @@ def render_sync_report(report: Mapping[str, Any]) -> None:
     print(f"Controller scope: {report['controller_key']}")
     print(f"State database: {report['state_db']}")
     print(f"Harvest start: {report['start_at']}")
+    print(f"Active jobs seen: {report.get('active_jobs_seen', 0)}")
+    print(f"Active job snapshots created: {report.get('active_job_snapshots_created', 0)}")
+    print(f"Active job host rows captured: {report.get('active_job_host_rows_captured', 0)}")
     print(f"Jobs fetched: {report['jobs_fetched']}")
     print(f"Jobs newly recorded: {report['jobs_processed']}")
     print(f"Jobs already present: {report['jobs_skipped_existing']}")

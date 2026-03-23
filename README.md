@@ -17,6 +17,8 @@ The design deliberately avoids the problems below:
 - API-managed or indirectly managed objects can be counted more accurately when inventories provide a canonical ID such as `node_count_id`.
 - Monitoring state is stored in a local SQLite database from the Python standard library.
 - Ephemeral inventories can be preserved locally by harvesting finished jobs before controller cleanup removes them.
+- The monitor can snapshot live inventory host variables for running jobs before the inventory is deleted.
+- The monitor can also harvest explicit resource identity markers from job events for indirect/API-managed objects.
 
 ## Command Summary
 
@@ -48,6 +50,8 @@ For multi-day monitoring, it counts unique nodes observed across captured snapsh
 It still does not gather facts from managed nodes.
 
 For controller job monitoring, it also harvests historical job-to-host observations so transient inventories that are created and deleted through the AAP API can still be counted after the job has completed.
+
+When `monitor` is running continuously, it first snapshots the host definitions for active jobs and then harvests completed jobs. That improves deduplication for short-lived inventories because `ansible_host` and custom identity vars can be preserved before the controller deletes the underlying host record.
 
 ## Supported Deployment Topologies
 
@@ -87,6 +91,28 @@ python3 node_counter.py sync \
   --ca-file /etc/pki/ca-trust/source/anchors/aap-ca.pem \
   --state-db /var/lib/node-counter/node_counter_state.db
 ```
+
+## What It Still Needs From Your AAP Content
+
+The utility can infer direct managed nodes from inventory and job history on its own.
+
+For indirect or API-managed objects, the most reliable path is to expose a stable identity in one of two ways:
+
+- represent the object as a distinct inventory host and set `node_count_id`
+- emit a stable identity in job output or `set_stats`, then run the monitor with `--harvest-event-identities`
+
+Recommended event keys are:
+
+- `node_count_id`
+- `managed_node_id`
+- `instance_id`
+- `vm_uuid`
+- `system_uuid`
+
+Plural list forms are also supported, for example:
+
+- `managed_node_ids`
+- `node_count_ids`
 
 ## Key Design Choice
 
@@ -182,6 +208,18 @@ python3 node_counter.py monitor \
   --interval-seconds 60
 ```
 
+Continuous monitoring with explicit event identity harvesting for indirect/API-managed resources:
+
+```bash
+python3 node_counter.py monitor \
+  --controller-url 'https://controller.example.com' \
+  --state-db /var/lib/node-counter/node_counter_state.db \
+  --interval-seconds 30 \
+  --harvest-event-identities \
+  --event-identity-var node_count_id \
+  --event-identity-var managed_node_id
+```
+
 30-day report from harvested jobs:
 
 ```bash
@@ -258,6 +296,7 @@ For most environments:
 - run `monitor` every 30 to 60 seconds for controller-based historical tracking
 - run `capture` once per day only when you specifically need inventory-state snapshots
 - place the SQLite file on persistent storage, not in an ephemeral execution environment filesystem
+- enable `--harvest-event-identities` when playbooks or collections can emit stable IDs for indirect/API-managed objects
 
 This maps well to an AAP scheduled job template or to `cron`.
 
@@ -277,6 +316,8 @@ That helps with:
 It does not infer assets that were never present in any harvested job or snapshot.
 
 Very short-lived assets can still be missed if controller job records are cleaned up before the monitor harvests them, so the monitor interval matters.
+
+For transient inventories specifically, continuous `monitor` mode is more accurate than periodic `sync` because it snapshots active-job host variables before cleanup.
 
 ## Controller Mode
 
@@ -383,6 +424,12 @@ Observed Nodes:
    last observed: 2026-03-20T18:42:07+00:00
    aliases: vm-001
    inventories: VMware API Inventory
+3. resource:bucket-01 [var:managed_node_id] (jobs=3)
+   identity: bucket-01
+   first observed: 2026-03-11T07:18:55+00:00
+   last observed: 2026-03-22T14:09:10+00:00
+   aliases: resource:bucket-01
+   inventories: Cloud API Inventory
 ```
 
 JSON output is available for all commands:
@@ -400,7 +447,9 @@ python3 node_counter.py count -i inventories/prod/hosts.yml --format json
 - DNS-based deduplication is optional because name resolution policies vary by environment.
 - Indirect or API-managed objects still need stable inventory modeling. If several objects share one API endpoint, use a canonical variable such as `node_count_id`.
 - If your execution environment is ephemeral, store the SQLite database on a mounted persistent path.
-- The utility can reliably preserve hosts used by transient inventories once it has harvested the finished job. It cannot generically infer every downstream cloud resource or API object touched inside a playbook unless those resources are represented as distinct inventory identities or emitted through explicit instrumentation.
+- The utility can reliably preserve hosts used by transient inventories when `monitor` is running continuously. A one-time backfill cannot recover host variables that were already deleted before collection.
+- The utility still cannot generically infer every downstream cloud resource or API object touched inside a playbook unless those resources are represented as distinct inventory identities or emitted through explicit instrumentation such as event identity markers.
+- Historical harvesting currently focuses on standard controller jobs. If your estate relies heavily on other controller execution record types, those would need a further extension.
 
 ## Testing
 

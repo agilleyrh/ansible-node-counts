@@ -306,6 +306,119 @@ class NodeCounterTests(unittest.TestCase):
             "https://controller.example.com",
         )
 
+    def test_live_job_host_snapshot_preserves_ansible_host_after_host_deletion(self):
+        job = {
+            "id": 501,
+            "name": "ephemeral-job",
+            "summary_fields": {
+                "inventory": {"id": 90, "name": "tmp-inventory"},
+            },
+        }
+        summary = {
+            "host": 700,
+            "host_name": "alias1.example.com",
+            "summary_fields": {
+                "host": {"id": 700, "name": "alias1.example.com"},
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = f"{temp_dir}/state.db"
+            node_counter.save_live_job_host_snapshots(
+                db_path=db_path,
+                controller_key="https://controller.example.com",
+                job_id=501,
+                host_snapshots=[
+                    {
+                        "host_id": 700,
+                        "host_name": "alias1.example.com",
+                        "inventory_name": "tmp-inventory",
+                        "variables_json": '{"ansible_host": "192.0.2.25"}',
+                    }
+                ],
+            )
+            provisional = node_counter.load_live_job_host_snapshots(
+                db_path=db_path,
+                controller_key="https://controller.example.com",
+                job_id=501,
+            )
+
+        client = mock.Mock()
+        client.get_json.side_effect = node_counter.NodeCounterError("controller API request failed for hosts/700/: 404 Not Found")
+        record = node_counter.build_host_record_from_summary(
+            client=client,
+            job=job,
+            summary=summary,
+            default_inventory_name="tmp-inventory",
+            source_label="tmp-inventory (job_id=501)",
+            host_cache={},
+            provisional_hosts=provisional,
+        )
+
+        self.assertEqual(record.variables["ansible_host"], "192.0.2.25")
+        identity, reason = node_counter.derive_identity(
+            record,
+            identity_vars=node_counter.DEFAULT_IDENTITY_VARS,
+            resolver=node_counter.HostResolver(resolve_dns=False),
+            port_aware=False,
+        )
+        self.assertEqual(identity, "192.0.2.25")
+        self.assertEqual(reason, "var:ansible_host")
+
+    def test_extract_event_identities_supports_scalar_and_list_markers(self):
+        event = {
+            "event_data": {
+                "res": {
+                    "node_count_id": "vm-001",
+                    "managed_node_ids": ["bucket-01", "bucket-02"],
+                }
+            }
+        }
+        identities = node_counter.extract_explicit_identities_from_event(
+            event=event,
+            scalar_keys={"node_count_id", "managed_node_id"},
+            list_keys={"managed_node_ids"},
+        )
+        self.assertEqual(
+            sorted(identities),
+            [
+                ("managed_node_id", "bucket-01"),
+                ("managed_node_id", "bucket-02"),
+                ("node_count_id", "vm-001"),
+            ],
+        )
+
+    def test_load_event_identity_records_creates_synthetic_records(self):
+        client = mock.Mock()
+        client.get_paginated.return_value = [
+            {
+                "event_data": {
+                    "res": {
+                        "node_count_id": "vm-001",
+                        "managed_node_ids": ["bucket-01", "bucket-02"],
+                    }
+                }
+            }
+        ]
+        job = {
+            "id": 77,
+            "name": "api-job",
+            "summary_fields": {
+                "inventory": {"id": 5, "name": "API Inventory"},
+            },
+        }
+        records = node_counter.load_event_identity_records(
+            client=client,
+            job=job,
+            batch_size=200,
+            event_identity_vars=("node_count_id", "managed_node_id"),
+        )
+        self.assertEqual(len(records), 3)
+        self.assertEqual(
+            {record.variables.get("node_count_id") or record.variables.get("managed_node_id") for record in records},
+            {"vm-001", "bucket-01", "bucket-02"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
