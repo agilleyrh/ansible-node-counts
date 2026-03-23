@@ -1,3 +1,4 @@
+import tempfile
 import socket
 import unittest
 from unittest import mock
@@ -122,6 +123,82 @@ class NodeCounterTests(unittest.TestCase):
             parsed,
             {"ansible_host": "192.0.2.10", "node_count_id": "srv-01"},
         )
+
+    def test_window_report_collapses_same_identity_across_captures(self):
+        report = {
+            "mode": "controller",
+            "total_source_records": 2,
+            "total_unique_nodes": 1,
+            "deduplicated_records": 1,
+            "nodes": [
+                {
+                    "identity": "192.0.2.10",
+                    "identity_source": "var:ansible_host",
+                    "display_name": "server1",
+                    "aliases": ["server1", "server1-dr"],
+                    "inventories": ["prod", "dr"],
+                    "sources": ["prod", "dr"],
+                    "source_record_count": 2,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = f"{temp_dir}/state.db"
+            node_counter.save_snapshot(
+                db_path=db_path,
+                captured_at="2026-01-01T00:00:00+00:00",
+                report=report,
+                scope={"controller_url": "https://controller.example.com"},
+            )
+            node_counter.save_snapshot(
+                db_path=db_path,
+                captured_at="2026-01-15T00:00:00+00:00",
+                report=report,
+                scope={"controller_url": "https://controller.example.com"},
+            )
+
+            with mock.patch("node_counter.utc_now", return_value=node_counter.datetime(2026, 1, 20, tzinfo=node_counter.timezone.utc)):
+                window_report = node_counter.build_window_report(db_path=db_path, days=30)
+
+        self.assertEqual(window_report["total_unique_nodes"], 1)
+        self.assertEqual(window_report["snapshots_considered"], 2)
+        self.assertEqual(window_report["nodes"][0]["snapshots_observed"], 2)
+        self.assertEqual(window_report["nodes"][0]["first_observed"], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(window_report["nodes"][0]["last_observed"], "2026-01-15T00:00:00+00:00")
+
+    def test_window_report_marks_partial_coverage(self):
+        report = {
+            "mode": "inventory",
+            "total_source_records": 1,
+            "total_unique_nodes": 1,
+            "deduplicated_records": 0,
+            "nodes": [
+                {
+                    "identity": "server-a",
+                    "identity_source": "inventory_hostname",
+                    "display_name": "server-a",
+                    "aliases": ["server-a"],
+                    "inventories": ["prod"],
+                    "sources": ["prod"],
+                    "source_record_count": 1,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = f"{temp_dir}/state.db"
+            node_counter.save_snapshot(
+                db_path=db_path,
+                captured_at="2026-01-10T00:00:00+00:00",
+                report=report,
+                scope={"inventories": ["inventory.yml"]},
+            )
+
+            with mock.patch("node_counter.utc_now", return_value=node_counter.datetime(2026, 3, 1, tzinfo=node_counter.timezone.utc)):
+                window_report = node_counter.build_window_report(db_path=db_path, days=60)
+
+        self.assertFalse(window_report["coverage"]["full_window_covered"])
 
 
 if __name__ == "__main__":

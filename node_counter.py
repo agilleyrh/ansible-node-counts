@@ -19,12 +19,14 @@ import ipaddress
 import json
 import os
 import shutil
+import sqlite3
 import socket
 import ssl
 import subprocess
 import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
@@ -37,6 +39,8 @@ DEFAULT_IDENTITY_VARS = (
     "vm_uuid",
     "system_uuid",
 )
+
+DEFAULT_STATE_DB = "node_counter_state.db"
 
 
 @dataclass(frozen=True)
@@ -84,10 +88,70 @@ class UniqueNode:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    commands = {"count", "capture", "report"}
+    if argv and argv[0] not in commands and argv[0] not in {"-h", "--help"}:
+        argv = ["count", *argv]
+
     parser = argparse.ArgumentParser(
-        description="Count unique managed nodes without gathering facts."
+        description="Count and monitor unique managed nodes without gathering facts."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    count_parser = subparsers.add_parser(
+        "count",
+        help="Run a one-time unique node count from inventories or controller.",
+    )
+    add_source_arguments(count_parser)
+    add_identity_arguments(count_parser)
+    add_output_arguments(count_parser)
+
+    capture_parser = subparsers.add_parser(
+        "capture",
+        help="Capture a deduplicated snapshot into a local SQLite state database.",
+    )
+    add_source_arguments(capture_parser)
+    add_identity_arguments(capture_parser)
+    add_output_arguments(capture_parser)
+    capture_parser.add_argument(
+        "--state-db",
+        default=DEFAULT_STATE_DB,
+        help=f"SQLite database used to store captures. Default: {DEFAULT_STATE_DB}",
+    )
+    capture_parser.add_argument(
+        "--captured-at",
+        help="Override the capture timestamp in ISO-8601 UTC form. Intended for testing.",
     )
 
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Report unique nodes observed in the last N days from stored captures.",
+    )
+    report_parser.add_argument(
+        "--state-db",
+        default=DEFAULT_STATE_DB,
+        help=f"SQLite database used to store captures. Default: {DEFAULT_STATE_DB}",
+    )
+    report_parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Lookback window in days. Typical values are 30, 60, or 90.",
+    )
+    report_parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format.",
+    )
+    report_parser.add_argument(
+        "--list",
+        action="store_true",
+        help="Include the deduplicated node list in text output.",
+    )
+    return parser.parse_args(argv)
+
+
+def add_source_arguments(parser: argparse.ArgumentParser) -> None:
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument(
         "-i",
@@ -118,7 +182,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="ARG",
         help="Extra argument to pass through to ansible-inventory. Repeat as needed.",
     )
-
     parser.add_argument(
         "--inventory-id",
         type=int,
@@ -139,36 +202,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Include disabled controller hosts in the count.",
     )
-
-    parser.add_argument(
-        "--identity-var",
-        action="append",
-        default=[],
-        metavar="VAR",
-        help="Custom host variable used as a canonical node identity. Checked before fallbacks.",
-    )
-    parser.add_argument(
-        "--resolve-dns",
-        action="store_true",
-        help="Resolve hostnames to IPs when deduplicating aliases.",
-    )
-    parser.add_argument(
-        "--port-aware",
-        action="store_true",
-        help="Treat ansible_port as part of the identity when ansible_host is used.",
-    )
-    parser.add_argument(
-        "--format",
-        choices=("text", "json"),
-        default="text",
-        help="Output format.",
-    )
-    parser.add_argument(
-        "--list",
-        action="store_true",
-        help="Include the deduplicated node list in text output.",
-    )
-
     parser.add_argument(
         "--token",
         help="Controller OAuth token. Defaults to CONTROLLER_OAUTH_TOKEN or TOWER_OAUTH_TOKEN.",
@@ -186,38 +219,71 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Skip TLS certificate verification for controller API calls.",
     )
-    return parser.parse_args(argv)
+
+
+def add_identity_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--identity-var",
+        action="append",
+        default=[],
+        metavar="VAR",
+        help="Custom host variable used as a canonical node identity. Checked before fallbacks.",
+    )
+    parser.add_argument(
+        "--resolve-dns",
+        action="store_true",
+        help="Resolve hostnames to IPs when deduplicating aliases.",
+    )
+    parser.add_argument(
+        "--port-aware",
+        action="store_true",
+        help="Treat ansible_port as part of the identity when ansible_host is used.",
+    )
+
+
+def add_output_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="Include the deduplicated node list in text output.",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    identity_vars = unique_preserving_order(tuple(args.identity_var) + DEFAULT_IDENTITY_VARS)
 
     try:
-        if args.controller_url:
-            records = load_hosts_from_controller(args)
-            mode = "controller"
-        else:
-            records = load_hosts_from_inventories(args)
-            mode = "inventory"
+        if args.command == "count":
+            return run_count_command(args)
+        if args.command == "capture":
+            return run_capture_command(args)
+        if args.command == "report":
+            return run_report_command(args)
+        raise NodeCounterError(f"unsupported command: {args.command}")
     except NodeCounterError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    nodes = deduplicate_hosts(
-        records,
+
+class NodeCounterError(RuntimeError):
+    """Raised when the utility cannot gather its input data."""
+
+
+def run_count_command(args: argparse.Namespace) -> int:
+    mode, records, identity_vars = collect_records_from_args(args)
+    report = build_current_report(
+        mode=mode,
+        records=records,
         identity_vars=identity_vars,
         resolve_dns=args.resolve_dns,
         port_aware=args.port_aware,
     )
-
-    report = {
-        "mode": mode,
-        "total_source_records": len(records),
-        "total_unique_nodes": len(nodes),
-        "deduplicated_records": len(records) - len(nodes),
-        "nodes": [node.to_dict() for node in nodes],
-    }
 
     if args.format == "json":
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -228,12 +294,129 @@ def main(argv: list[str] | None = None) -> int:
             identity_vars=identity_vars,
             resolve_dns=args.resolve_dns,
         )
-
     return 0
 
 
-class NodeCounterError(RuntimeError):
-    """Raised when the utility cannot gather its input data."""
+def run_capture_command(args: argparse.Namespace) -> int:
+    mode, records, identity_vars = collect_records_from_args(args)
+    report = build_current_report(
+        mode=mode,
+        records=records,
+        identity_vars=identity_vars,
+        resolve_dns=args.resolve_dns,
+        port_aware=args.port_aware,
+    )
+    captured_at = parse_capture_time(args.captured_at)
+    snapshot_id = save_snapshot(
+        db_path=args.state_db,
+        captured_at=captured_at,
+        report=report,
+        scope=build_scope_from_args(args),
+    )
+
+    capture_report = dict(report)
+    capture_report.update(
+        {
+            "captured_at": captured_at,
+            "snapshot_id": snapshot_id,
+            "state_db": str(Path(args.state_db)),
+        }
+    )
+
+    if args.format == "json":
+        print(json.dumps(capture_report, indent=2, sort_keys=True))
+    else:
+        render_capture_report(
+            report=capture_report,
+            list_nodes=args.list,
+            identity_vars=identity_vars,
+            resolve_dns=args.resolve_dns,
+        )
+    return 0
+
+
+def run_report_command(args: argparse.Namespace) -> int:
+    if args.days <= 0:
+        raise NodeCounterError("--days must be greater than zero")
+
+    report = build_window_report(
+        db_path=args.state_db,
+        days=args.days,
+    )
+
+    if args.format == "json":
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        render_window_report(report=report, list_nodes=args.list)
+    return 0
+
+
+def collect_records_from_args(
+    args: argparse.Namespace,
+) -> tuple[str, list[HostRecord], tuple[str, ...]]:
+    identity_vars = unique_preserving_order(tuple(args.identity_var) + DEFAULT_IDENTITY_VARS)
+    if args.controller_url:
+        return "controller", load_hosts_from_controller(args), identity_vars
+    return "inventory", load_hosts_from_inventories(args), identity_vars
+
+
+def build_current_report(
+    mode: str,
+    records: list[HostRecord],
+    identity_vars: tuple[str, ...],
+    resolve_dns: bool,
+    port_aware: bool,
+) -> dict[str, Any]:
+    nodes = deduplicate_hosts(
+        records,
+        identity_vars=identity_vars,
+        resolve_dns=resolve_dns,
+        port_aware=port_aware,
+    )
+    return {
+        "mode": mode,
+        "total_source_records": len(records),
+        "total_unique_nodes": len(nodes),
+        "deduplicated_records": len(records) - len(nodes),
+        "nodes": [node.to_dict() for node in nodes],
+    }
+
+
+def parse_capture_time(value: str | None) -> str:
+    if value is None:
+        return utc_now().isoformat()
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise NodeCounterError(f"invalid --captured-at timestamp: {value}") from exc
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.replace(microsecond=0).isoformat()
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def build_scope_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    if args.controller_url:
+        return {
+            "controller_url": args.controller_url,
+            "inventory_ids": list(args.inventory_id),
+            "inventory_names": list(args.inventory_name),
+            "include_disabled": bool(args.include_disabled),
+        }
+
+    return {
+        "inventories": list(args.inventory),
+        "limit": args.limit,
+        "playbook_dir": args.playbook_dir,
+        "ansible_inventory_args": list(args.ansible_inventory_arg),
+    }
 
 
 def load_hosts_from_inventories(args: argparse.Namespace) -> list[HostRecord]:
@@ -675,6 +858,250 @@ def try_yaml_loader():
         return None
 
 
+def open_state_db(db_path: str) -> sqlite3.Connection:
+    path = Path(db_path)
+    if path.parent != Path("."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    initialize_state_db(connection)
+    return connection
+
+
+def initialize_state_db(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            captured_at TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            scope_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS snapshot_nodes (
+            snapshot_id INTEGER NOT NULL,
+            identity TEXT NOT NULL,
+            identity_source TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            aliases_json TEXT NOT NULL,
+            inventories_json TEXT NOT NULL,
+            sources_json TEXT NOT NULL,
+            source_record_count INTEGER NOT NULL,
+            PRIMARY KEY (snapshot_id, identity),
+            FOREIGN KEY (snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_snapshots_captured_at
+        ON snapshots (captured_at);
+
+        CREATE INDEX IF NOT EXISTS idx_snapshot_nodes_identity
+        ON snapshot_nodes (identity);
+        """
+    )
+
+
+def save_snapshot(
+    db_path: str,
+    captured_at: str,
+    report: Mapping[str, Any],
+    scope: Mapping[str, Any],
+) -> int:
+    connection = open_state_db(db_path)
+    try:
+        with connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO snapshots (captured_at, mode, scope_json)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    captured_at,
+                    str(report["mode"]),
+                    json.dumps(scope, sort_keys=True),
+                ),
+            )
+            snapshot_id = int(cursor.lastrowid)
+            nodes = report.get("nodes", [])
+            if not isinstance(nodes, list):
+                raise NodeCounterError("invalid capture report payload: nodes must be a list")
+
+            for node in nodes:
+                connection.execute(
+                    """
+                    INSERT INTO snapshot_nodes (
+                        snapshot_id,
+                        identity,
+                        identity_source,
+                        display_name,
+                        aliases_json,
+                        inventories_json,
+                        sources_json,
+                        source_record_count
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        str(node.get("identity", "")),
+                        str(node.get("identity_source", "")),
+                        str(node.get("display_name", "")),
+                        json.dumps(node.get("aliases", []), sort_keys=True),
+                        json.dumps(node.get("inventories", []), sort_keys=True),
+                        json.dumps(node.get("sources", []), sort_keys=True),
+                        int(node.get("source_record_count", 0)),
+                    ),
+                )
+        return snapshot_id
+    finally:
+        connection.close()
+
+
+def build_window_report(db_path: str, days: int) -> dict[str, Any]:
+    connection = open_state_db(db_path)
+    cutoff_dt = utc_now() - timedelta(days=days)
+    cutoff = cutoff_dt.isoformat()
+
+    try:
+        overall = connection.execute(
+            """
+            SELECT COUNT(*) AS snapshot_count,
+                   MIN(captured_at) AS first_capture,
+                   MAX(captured_at) AS last_capture
+            FROM snapshots
+            """
+        ).fetchone()
+        if overall is None or int(overall["snapshot_count"]) == 0:
+            raise NodeCounterError(
+                f"no captures were found in the state database: {Path(db_path)}"
+            )
+
+        snapshot_rows = connection.execute(
+            """
+            SELECT id, captured_at
+            FROM snapshots
+            WHERE captured_at >= ?
+            ORDER BY captured_at ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        if not snapshot_rows:
+            return {
+                "mode": "monitor-report",
+                "state_db": str(Path(db_path)),
+                "window_days": days,
+                "requested_start": cutoff,
+                "requested_end": utc_now().isoformat(),
+                "snapshots_considered": 0,
+                "total_unique_nodes": 0,
+                "total_observations": 0,
+                "coverage": {
+                    "first_capture": overall["first_capture"],
+                    "last_capture": overall["last_capture"],
+                    "full_window_covered": False,
+                },
+                "nodes": [],
+            }
+
+        rows = connection.execute(
+            """
+            SELECT s.id AS snapshot_id,
+                   s.captured_at,
+                   n.identity,
+                   n.identity_source,
+                   n.display_name,
+                   n.aliases_json,
+                   n.inventories_json,
+                   n.sources_json
+            FROM snapshots AS s
+            JOIN snapshot_nodes AS n
+              ON n.snapshot_id = s.id
+            WHERE s.captured_at >= ?
+            ORDER BY s.captured_at ASC, n.identity ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        aggregated: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            identity = str(row["identity"])
+            entry = aggregated.get(identity)
+            if entry is None:
+                entry = {
+                    "identity": identity,
+                    "identity_source": str(row["identity_source"]),
+                    "display_name": str(row["display_name"]),
+                    "aliases": set(),
+                    "inventories": set(),
+                    "sources": set(),
+                    "first_observed": str(row["captured_at"]),
+                    "last_observed": str(row["captured_at"]),
+                    "snapshots_observed": 0,
+                }
+                aggregated[identity] = entry
+
+            entry["aliases"].update(parse_json_list(row["aliases_json"]))
+            entry["inventories"].update(parse_json_list(row["inventories_json"]))
+            entry["sources"].update(parse_json_list(row["sources_json"]))
+            entry["first_observed"] = min(entry["first_observed"], str(row["captured_at"]))
+            entry["last_observed"] = max(entry["last_observed"], str(row["captured_at"]))
+            entry["snapshots_observed"] += 1
+
+        nodes = []
+        for entry in sorted(aggregated.values(), key=lambda item: item["display_name"].lower()):
+            nodes.append(
+                {
+                    "identity": entry["identity"],
+                    "identity_source": entry["identity_source"],
+                    "display_name": entry["display_name"],
+                    "aliases": sorted(entry["aliases"]),
+                    "inventories": sorted(entry["inventories"]),
+                    "sources": sorted(entry["sources"]),
+                    "first_observed": entry["first_observed"],
+                    "last_observed": entry["last_observed"],
+                    "snapshots_observed": entry["snapshots_observed"],
+                }
+            )
+
+        return {
+            "mode": "monitor-report",
+            "state_db": str(Path(db_path)),
+            "window_days": days,
+            "requested_start": cutoff,
+            "requested_end": utc_now().isoformat(),
+            "snapshots_considered": len(snapshot_rows),
+            "total_unique_nodes": len(nodes),
+            "total_observations": len(rows),
+            "coverage": {
+                "first_capture": overall["first_capture"],
+                "last_capture": overall["last_capture"],
+                "full_window_covered": str(overall["first_capture"]) <= cutoff,
+            },
+            "nodes": nodes,
+        }
+    finally:
+        connection.close()
+
+
+def parse_json_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if not isinstance(value, str):
+        return []
+
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(loaded, list):
+        return []
+    return [str(item) for item in loaded]
+
+
 def render_text_report(
     report: Mapping[str, Any],
     list_nodes: bool,
@@ -706,6 +1133,65 @@ def render_text_report(
             f"(records={node.get('source_record_count')})"
         )
         print(f"   identity: {node.get('identity')}")
+        print(f"   aliases: {aliases}")
+        print(f"   inventories: {inventories}")
+
+
+def render_capture_report(
+    report: Mapping[str, Any],
+    list_nodes: bool,
+    identity_vars: tuple[str, ...],
+    resolve_dns: bool,
+) -> None:
+    print(f"Capture timestamp: {report['captured_at']}")
+    print(f"Snapshot ID: {report['snapshot_id']}")
+    print(f"State database: {report['state_db']}")
+    print("")
+    render_text_report(
+        report=report,
+        list_nodes=list_nodes,
+        identity_vars=identity_vars,
+        resolve_dns=resolve_dns,
+    )
+
+
+def render_window_report(report: Mapping[str, Any], list_nodes: bool) -> None:
+    coverage = report.get("coverage", {})
+    print(f"Mode: {report['mode']}")
+    print(f"State database: {report['state_db']}")
+    print(f"Window: last {report['window_days']} days")
+    print(f"Requested start: {report['requested_start']}")
+    print(f"Requested end: {report['requested_end']}")
+    print(f"Snapshots considered: {report['snapshots_considered']}")
+    print(f"Unique managed nodes observed: {report['total_unique_nodes']}")
+    print(f"Observation rows considered: {report['total_observations']}")
+    print(f"Oldest capture in database: {coverage.get('first_capture')}")
+    print(f"Newest capture in database: {coverage.get('last_capture')}")
+    print(
+        "Full requested window covered: "
+        + ("yes" if coverage.get("full_window_covered") else "no")
+    )
+
+    if not list_nodes:
+        return
+
+    nodes = report.get("nodes", [])
+    if not isinstance(nodes, list) or not nodes:
+        return
+
+    print("")
+    print("Observed Nodes:")
+    for index, node in enumerate(nodes, start=1):
+        aliases = ", ".join(node.get("aliases", []))
+        inventories = ", ".join(node.get("inventories", []))
+        print(
+            f"{index}. {node.get('display_name')} "
+            f"[{node.get('identity_source')}] "
+            f"(snapshots={node.get('snapshots_observed')})"
+        )
+        print(f"   identity: {node.get('identity')}")
+        print(f"   first observed: {node.get('first_observed')}")
+        print(f"   last observed: {node.get('last_observed')}")
         print(f"   aliases: {aliases}")
         print(f"   inventories: {inventories}")
 
