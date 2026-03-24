@@ -9,6 +9,7 @@ It supports:
 - continuous monitoring for transient inventories and short-lived hosts
 - rolling 30/60/90-day reports
 - optional event-based identities for indirect or API-managed resources
+- optional policy-based include/exclude rules for node-definition edge cases
 
 ## Why This Exists
 
@@ -111,6 +112,67 @@ Examples:
 
 - If `server1.example.com` and `server1-dr.example.com` both use `ansible_host: 192.0.2.10`, they collapse to one node.
 - If two API-managed objects share one endpoint, give each object a stable identity such as `node_count_id` so they count separately.
+
+## Policy Support
+
+The utility can now apply a simple policy layer during `count` and `report`.
+
+This is meant to help with business-rule decisions from your node-definition guidance, such as:
+
+- excluding `container_on_vm`
+- excluding `security_group` or `network_acl`
+- honoring an explicit `node_count_excluded` marker
+
+Built-in defaults already exclude these types when they are present in metadata:
+
+- `container_on_vm`
+- `containers_on_vm`
+- `security_group`
+- `cloud_security_group`
+- `network_acl`
+- `nacl`
+- `layer3_rule`
+- `layer4_rule`
+
+Metadata the policy layer can use includes:
+
+- `node_count_type`
+- `managed_node_type`
+- `node_type`
+- `node_count_count_as`
+- `node_count_excluded`
+- `k8s_kind`
+- `cloud_resource_type`
+
+Example policy file:
+
+```json
+{
+  "exclude_types": [
+    "container_on_vm",
+    "security_group",
+    "network_acl"
+  ],
+  "count_as_types": {
+    "deployment": "openshift_deployment"
+  },
+  "exclude_if_metadata": {
+    "node_count_excluded": ["true", "1", "yes"]
+  }
+}
+```
+
+Example use:
+
+```bash
+python3 node_counter.py report \
+  --state-db /var/lib/node-counter/node_counter_state.db \
+  --source jobs \
+  --days 90 \
+  --policy-file ./node-count-policy.json \
+  --show-excluded \
+  --list
+```
 
 ## Quick Start
 
@@ -257,6 +319,9 @@ Example `report --source jobs --days 30 --list` output:
 ```text
 Mode: job-report
 Data source: jobs
+Policy applied: yes
+Policy source: built-in-defaults
+Raw unique managed nodes: 1278
 State database: /var/lib/node-counter/node_counter_state.db
 Controller scope: https://controller.example.com
 Window: last 30 days
@@ -264,6 +329,7 @@ Requested start: 2026-02-21T12:00:00+00:00
 Requested end: 2026-03-23T12:00:00+00:00
 Jobs considered: 418
 Unique managed nodes observed: 1264
+Excluded unique nodes: 14
 Observation rows considered: 3910
 Oldest observation in database: 2025-12-23T09:15:12+00:00
 Newest observation in database: 2026-03-23T11:58:41+00:00
@@ -278,6 +344,7 @@ Observed Nodes:
    inventories: Production, Disaster Recovery
 2. vm-001 [var:node_count_id] (jobs=8)
    identity: vm-001
+   type: virtual_machine
    first observed: 2026-03-01T00:14:19+00:00
    last observed: 2026-03-20T18:42:07+00:00
    aliases: vm-001
@@ -304,6 +371,7 @@ python3 node_counter.py count -i inventories/prod/hosts.yml --format json
 - For controller-based history, `monitor` every 30 to 60 seconds is a reasonable starting point.
 - For point-in-time inventory snapshots, `capture` once per day is usually enough.
 - Enable `--harvest-event-identities` when playbooks or collections can emit stable IDs for indirect/API-managed objects.
+- Use `--policy-file` when you need local business-rule handling beyond the built-in defaults.
 
 ## Limitations
 

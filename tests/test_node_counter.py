@@ -1,5 +1,6 @@
 import tempfile
 import socket
+import json
 import unittest
 from unittest import mock
 
@@ -395,6 +396,7 @@ class NodeCounterTests(unittest.TestCase):
                 "event_data": {
                     "res": {
                         "node_count_id": "vm-001",
+                        "node_count_type": "openshift_deployment",
                         "managed_node_ids": ["bucket-01", "bucket-02"],
                     }
                 }
@@ -418,6 +420,75 @@ class NodeCounterTests(unittest.TestCase):
             {record.variables.get("node_count_id") or record.variables.get("managed_node_id") for record in records},
             {"vm-001", "bucket-01", "bucket-02"},
         )
+        self.assertEqual(records[0].variables.get("node_count_type"), "openshift_deployment")
+
+    def test_apply_policy_excludes_container_on_vm_by_default(self):
+        report = {
+            "mode": "inventory",
+            "total_source_records": 1,
+            "total_unique_nodes": 1,
+            "deduplicated_records": 0,
+            "nodes": [
+                {
+                    "identity": "container-01",
+                    "identity_source": "var:node_count_id",
+                    "display_name": "container-01",
+                    "aliases": ["container-01"],
+                    "inventories": ["prod"],
+                    "sources": ["prod"],
+                    "source_record_count": 1,
+                    "metadata": {"node_count_type": "container_on_vm"},
+                }
+            ],
+        }
+
+        applied = node_counter.apply_policy_if_requested(
+            report=report,
+            policy_file=None,
+            show_excluded=True,
+        )
+
+        self.assertEqual(applied["total_unique_nodes"], 0)
+        self.assertEqual(applied["excluded_unique_nodes"], 1)
+        self.assertEqual(applied["excluded_nodes"][0]["effective_type"], "container_on_vm")
+
+    def test_apply_policy_honors_external_policy_file(self):
+        report = {
+            "mode": "inventory",
+            "total_source_records": 1,
+            "total_unique_nodes": 1,
+            "deduplicated_records": 0,
+            "nodes": [
+                {
+                    "identity": "sg-01",
+                    "identity_source": "var:managed_node_id",
+                    "display_name": "resource:sg-01",
+                    "aliases": ["resource:sg-01"],
+                    "inventories": ["cloud"],
+                    "sources": ["cloud"],
+                    "source_record_count": 1,
+                    "metadata": {"cloud_resource_type": "security_group"},
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            policy_file = f"{temp_dir}/policy.json"
+            with open(policy_file, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "exclude_types": ["security_group"],
+                    },
+                    handle,
+                )
+            applied = node_counter.apply_policy_if_requested(
+                report=report,
+                policy_file=policy_file,
+                show_excluded=False,
+            )
+
+        self.assertEqual(applied["total_unique_nodes"], 0)
+        self.assertEqual(applied["excluded_unique_nodes"], 1)
 
 
 if __name__ == "__main__":

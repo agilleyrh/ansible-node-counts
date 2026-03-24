@@ -43,6 +43,20 @@ DEFAULT_IDENTITY_VARS = (
 
 DEFAULT_STATE_DB = "node_counter_state.db"
 
+POLICY_METADATA_KEYS = (
+    "node_count_type",
+    "managed_node_type",
+    "node_type",
+    "node_count_platform",
+    "node_count_category",
+    "node_count_count_as",
+    "node_count_excluded",
+    "node_count_exclude_reason",
+    "node_count_indirect",
+    "k8s_kind",
+    "cloud_resource_type",
+)
+
 
 @dataclass(frozen=True)
 class HostRecord:
@@ -65,12 +79,14 @@ class UniqueNode:
     aliases: set[str] = field(default_factory=set)
     inventories: set[str] = field(default_factory=set)
     sources: set[str] = field(default_factory=set)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def add(self, record: HostRecord) -> None:
         self.records.append(record)
         self.aliases.add(record.name)
         self.inventories.add(record.inventory)
         self.sources.add(record.source)
+        self.metadata = merge_node_metadata(self.metadata, extract_node_metadata(record.variables))
 
     @property
     def display_name(self) -> str:
@@ -85,6 +101,7 @@ class UniqueNode:
             "inventories": sorted(self.inventories),
             "sources": sorted(self.sources),
             "source_record_count": len(self.records),
+            "metadata": dict(self.metadata),
         }
 
 
@@ -105,6 +122,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     add_source_arguments(count_parser)
     add_identity_arguments(count_parser)
     add_output_arguments(count_parser)
+    add_policy_arguments(count_parser)
 
     capture_parser = subparsers.add_parser(
         "capture",
@@ -269,6 +287,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Include the deduplicated node list in text output.",
     )
+    add_policy_arguments(report_parser)
     return parser.parse_args(argv)
 
 
@@ -424,6 +443,18 @@ def add_output_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_policy_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--policy-file",
+        help="Optional JSON policy file used to include, exclude, or relabel node types.",
+    )
+    parser.add_argument(
+        "--show-excluded",
+        action="store_true",
+        help="Include excluded nodes in JSON output and text reports when a policy is applied.",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
 
@@ -456,6 +487,11 @@ def run_count_command(args: argparse.Namespace) -> int:
         identity_vars=identity_vars,
         resolve_dns=args.resolve_dns,
         port_aware=args.port_aware,
+    )
+    report = apply_policy_if_requested(
+        report=report,
+        policy_file=args.policy_file,
+        show_excluded=args.show_excluded,
     )
 
     if args.format == "json":
@@ -547,6 +583,11 @@ def run_report_command(args: argparse.Namespace) -> int:
         source=args.source,
         controller_key=controller_key,
     )
+    report = apply_policy_if_requested(
+        report=report,
+        policy_file=args.policy_file,
+        show_excluded=args.show_excluded,
+    )
 
     if args.format == "json":
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -584,6 +625,47 @@ def build_current_report(
         "deduplicated_records": len(records) - len(nodes),
         "nodes": [node.to_dict() for node in nodes],
     }
+
+
+def extract_node_metadata(variables: Mapping[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for key in POLICY_METADATA_KEYS:
+        if key not in variables:
+            continue
+        value = normalize_metadata_value(variables.get(key))
+        if value in ("", [], None):
+            continue
+        metadata[key] = value
+    return metadata
+
+
+def normalize_metadata_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (list, tuple, set)):
+        normalized = []
+        for item in value:
+            normalized_item = normalize_metadata_value(item)
+            if normalized_item in ("", [], None):
+                continue
+            normalized.append(normalized_item)
+        return normalized
+    text = str(value).strip()
+    if not text:
+        return ""
+    return text
+
+
+def merge_node_metadata(existing: Mapping[str, Any], incoming: Mapping[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in incoming.items():
+        if key not in merged or merged[key] in ("", [], None):
+            merged[key] = value
+    return merged
 
 
 def parse_capture_time(value: str | None) -> str:
@@ -1193,6 +1275,7 @@ def load_event_identity_records(
     records: list[HostRecord] = []
     seen_keys: set[tuple[str, str]] = set()
     for event in events:
+        event_metadata = extract_event_metadata(event)
         for identity_var, identity_value in extract_explicit_identities_from_event(
             event=event,
             scalar_keys=set(event_identity_vars),
@@ -1205,12 +1288,14 @@ def load_event_identity_records(
             if dedupe_key in seen_keys:
                 continue
             seen_keys.add(dedupe_key)
+            variables = dict(event_metadata)
+            variables[identity_var] = normalized
             records.append(
                 HostRecord(
                     name=f"resource:{normalized}",
                     inventory=inventory_name,
                     source=f"{inventory_name} (job_id={job_id}, job_name={job_name}, event-identities)",
-                    variables={identity_var: normalized},
+                    variables=variables,
                     enabled=True,
                 )
             )
@@ -1259,6 +1344,25 @@ def normalize_identity_values(value: Any) -> list[str]:
     if not text:
         return []
     return [text]
+
+
+def extract_event_metadata(event: Mapping[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+
+    def walk(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                if key in POLICY_METADATA_KEYS and key not in metadata:
+                    normalized = normalize_metadata_value(nested)
+                    if normalized not in ("", [], None):
+                        metadata[key] = normalized
+                walk(nested)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(event.get("event_data", {}))
+    return metadata
 
 
 def save_job_observation(
@@ -1328,9 +1432,10 @@ def save_job_observation(
                         display_name,
                         aliases_json,
                         inventories_json,
-                        sources_json
+                        sources_json,
+                        metadata_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         controller_key,
@@ -1341,6 +1446,7 @@ def save_job_observation(
                         json.dumps(sorted(node.aliases), sort_keys=True),
                         json.dumps(sorted(node.inventories), sort_keys=True),
                         json.dumps(sorted(node.sources), sort_keys=True),
+                        json.dumps(node.metadata, sort_keys=True),
                     ),
                 )
     finally:
@@ -1823,6 +1929,7 @@ def initialize_state_db(connection: sqlite3.Connection) -> None:
             aliases_json TEXT NOT NULL,
             inventories_json TEXT NOT NULL,
             sources_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             source_record_count INTEGER NOT NULL,
             PRIMARY KEY (snapshot_id, identity),
             FOREIGN KEY (snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
@@ -1858,6 +1965,7 @@ def initialize_state_db(connection: sqlite3.Connection) -> None:
             aliases_json TEXT NOT NULL,
             inventories_json TEXT NOT NULL,
             sources_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY (controller_key, job_id, identity),
             FOREIGN KEY (controller_key, job_id)
                 REFERENCES observed_jobs(controller_key, job_id)
@@ -1883,6 +1991,33 @@ def initialize_state_db(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_live_job_hosts_job
         ON live_job_hosts (controller_key, job_id);
         """
+    )
+    ensure_table_column(
+        connection,
+        table_name="snapshot_nodes",
+        column_name="metadata_json",
+        column_definition="TEXT NOT NULL DEFAULT '{}'",
+    )
+    ensure_table_column(
+        connection,
+        table_name="observed_job_nodes",
+        column_name="metadata_json",
+        column_definition="TEXT NOT NULL DEFAULT '{}'",
+    )
+
+
+def ensure_table_column(
+    connection: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    existing = {str(row[1]) for row in rows}
+    if column_name in existing:
+        return
+    connection.execute(
+        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
     )
 
 
@@ -1922,9 +2057,10 @@ def save_snapshot(
                         aliases_json,
                         inventories_json,
                         sources_json,
+                        metadata_json,
                         source_record_count
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot_id,
@@ -1934,6 +2070,7 @@ def save_snapshot(
                         json.dumps(node.get("aliases", []), sort_keys=True),
                         json.dumps(node.get("inventories", []), sort_keys=True),
                         json.dumps(node.get("sources", []), sort_keys=True),
+                        json.dumps(node.get("metadata", {}), sort_keys=True),
                         int(node.get("source_record_count", 0)),
                     ),
                 )
@@ -1998,7 +2135,8 @@ def build_snapshot_window_report(db_path: str, days: int) -> dict[str, Any]:
                    n.display_name,
                    n.aliases_json,
                    n.inventories_json,
-                   n.sources_json
+                   n.sources_json,
+                   n.metadata_json
             FROM snapshots AS s
             JOIN snapshot_nodes AS n
               ON n.snapshot_id = s.id
@@ -2020,6 +2158,7 @@ def build_snapshot_window_report(db_path: str, days: int) -> dict[str, Any]:
                     "aliases": set(),
                     "inventories": set(),
                     "sources": set(),
+                    "metadata": {},
                     "first_observed": str(row["captured_at"]),
                     "last_observed": str(row["captured_at"]),
                     "snapshots_observed": 0,
@@ -2029,6 +2168,10 @@ def build_snapshot_window_report(db_path: str, days: int) -> dict[str, Any]:
             entry["aliases"].update(parse_json_list(row["aliases_json"]))
             entry["inventories"].update(parse_json_list(row["inventories_json"]))
             entry["sources"].update(parse_json_list(row["sources_json"]))
+            entry["metadata"] = merge_node_metadata(
+                entry["metadata"],
+                parse_json_mapping(row["metadata_json"]),
+            )
             entry["first_observed"] = min(entry["first_observed"], str(row["captured_at"]))
             entry["last_observed"] = max(entry["last_observed"], str(row["captured_at"]))
             entry["snapshots_observed"] += 1
@@ -2043,6 +2186,7 @@ def build_snapshot_window_report(db_path: str, days: int) -> dict[str, Any]:
                     "aliases": sorted(entry["aliases"]),
                     "inventories": sorted(entry["inventories"]),
                     "sources": sorted(entry["sources"]),
+                    "metadata": dict(entry["metadata"]),
                     "first_observed": entry["first_observed"],
                     "last_observed": entry["last_observed"],
                     "snapshots_observed": entry["snapshots_observed"],
@@ -2117,7 +2261,8 @@ def build_job_window_report(
                    n.display_name,
                    n.aliases_json,
                    n.inventories_json,
-                   n.sources_json
+                   n.sources_json,
+                   n.metadata_json
             FROM observed_jobs AS j
             JOIN observed_job_nodes AS n
               ON n.controller_key = j.controller_key
@@ -2162,6 +2307,7 @@ def build_job_window_report(
                     "aliases": set(),
                     "inventories": set(),
                     "sources": set(),
+                    "metadata": {},
                     "first_observed": str(row["finished_at"]),
                     "last_observed": str(row["finished_at"]),
                     "jobs_observed": set(),
@@ -2171,6 +2317,10 @@ def build_job_window_report(
             entry["aliases"].update(parse_json_list(row["aliases_json"]))
             entry["inventories"].update(parse_json_list(row["inventories_json"]))
             entry["sources"].update(parse_json_list(row["sources_json"]))
+            entry["metadata"] = merge_node_metadata(
+                entry["metadata"],
+                parse_json_mapping(row["metadata_json"]),
+            )
             entry["first_observed"] = min(entry["first_observed"], str(row["finished_at"]))
             entry["last_observed"] = max(entry["last_observed"], str(row["finished_at"]))
             entry["jobs_observed"].add(int(row["job_id"]))
@@ -2185,6 +2335,7 @@ def build_job_window_report(
                     "aliases": sorted(entry["aliases"]),
                     "inventories": sorted(entry["inventories"]),
                     "sources": sorted(entry["sources"]),
+                    "metadata": dict(entry["metadata"]),
                     "first_observed": entry["first_observed"],
                     "last_observed": entry["last_observed"],
                     "jobs_observed": len(entry["jobs_observed"]),
@@ -2230,6 +2381,187 @@ def build_best_window_report(
         return build_snapshot_window_report(db_path=db_path, days=days)
 
 
+def apply_policy_if_requested(
+    report: Mapping[str, Any],
+    policy_file: str | None,
+    show_excluded: bool,
+) -> dict[str, Any]:
+    policy = load_policy(policy_file)
+    return apply_policy_to_report(report=report, policy=policy, policy_file=policy_file, show_excluded=show_excluded)
+
+
+def load_policy(policy_file: str | None) -> dict[str, Any]:
+    policy = default_policy()
+    if not policy_file:
+        return policy
+
+    try:
+        with open(policy_file, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except OSError as exc:
+        raise NodeCounterError(f"unable to read policy file {policy_file}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise NodeCounterError(f"invalid JSON in policy file {policy_file}: {exc}") from exc
+
+    if not isinstance(loaded, Mapping):
+        raise NodeCounterError(f"policy file must contain a JSON object: {policy_file}")
+
+    policy["exclude_types"] = unique_preserving_order(
+        tuple(policy["exclude_types"]) + tuple(str(item) for item in loaded.get("exclude_types", []))
+    )
+    policy["type_aliases"].update(string_mapping(loaded.get("type_aliases")))
+    policy["count_as_types"].update(string_mapping(loaded.get("count_as_types")))
+    policy["exclude_if_metadata"].update(mapping_of_string_lists(loaded.get("exclude_if_metadata")))
+    return policy
+
+
+def default_policy() -> dict[str, Any]:
+    return {
+        "exclude_types": (
+            "container_on_vm",
+            "containers_on_vm",
+            "network_acl",
+            "nacl",
+            "security_group",
+            "cloud_security_group",
+            "layer3_rule",
+            "layer4_rule",
+        ),
+        "type_aliases": {},
+        "count_as_types": {},
+        "exclude_if_metadata": {
+            "node_count_excluded": ["1", "true", "yes", "on"],
+        },
+    }
+
+
+def string_mapping(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(key): str(item) for key, item in value.items()}
+
+
+def mapping_of_string_lists(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, Mapping):
+        return {}
+    normalized: dict[str, list[str]] = {}
+    for key, item in value.items():
+        if isinstance(item, (list, tuple, set)):
+            normalized[str(key)] = [str(entry) for entry in item]
+        else:
+            normalized[str(key)] = [str(item)]
+    return normalized
+
+
+def apply_policy_to_report(
+    report: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    policy_file: str | None,
+    show_excluded: bool,
+) -> dict[str, Any]:
+    updated = dict(report)
+    raw_nodes = report.get("nodes", [])
+    if not isinstance(raw_nodes, list):
+        updated["policy"] = {
+            "applied": bool(policy_file),
+            "policy_file": policy_file or "built-in-defaults",
+        }
+        return updated
+
+    included_nodes: list[dict[str, Any]] = []
+    excluded_nodes: list[dict[str, Any]] = []
+    for raw_node in raw_nodes:
+        if not isinstance(raw_node, Mapping):
+            continue
+        node = dict(raw_node)
+        decision = evaluate_node_policy(node, policy)
+        node["effective_type"] = decision["effective_type"]
+        node["policy_decision"] = decision["action"]
+        node["policy_reason"] = decision["reason"]
+        if decision["action"] == "exclude":
+            excluded_nodes.append(node)
+        else:
+            included_nodes.append(node)
+
+    updated["policy"] = {
+        "applied": True,
+        "policy_file": policy_file or "built-in-defaults",
+        "raw_unique_nodes": len(raw_nodes),
+        "included_unique_nodes": len(included_nodes),
+        "excluded_unique_nodes": len(excluded_nodes),
+    }
+    updated["total_unique_nodes_raw"] = len(raw_nodes)
+    updated["excluded_unique_nodes"] = len(excluded_nodes)
+    updated["total_unique_nodes"] = len(included_nodes)
+    updated["nodes"] = included_nodes
+    if show_excluded:
+        updated["excluded_nodes"] = excluded_nodes
+    return updated
+
+
+def evaluate_node_policy(node: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, str]:
+    metadata = node.get("metadata", {})
+    metadata_map = metadata if isinstance(metadata, Mapping) else {}
+    effective_type = derive_effective_type(metadata_map, policy)
+
+    for key, values in policy.get("exclude_if_metadata", {}).items():
+        if metadata_matches_any(metadata_map.get(key), values):
+            return {
+                "action": "exclude",
+                "effective_type": effective_type,
+                "reason": f"metadata:{key}",
+            }
+
+    if effective_type and normalize_type_name(effective_type) in {
+        normalize_type_name(item) for item in policy.get("exclude_types", [])
+    }:
+        return {
+            "action": "exclude",
+            "effective_type": effective_type,
+            "reason": f"type:{effective_type}",
+        }
+
+    return {
+        "action": "include",
+        "effective_type": effective_type,
+        "reason": "counted",
+    }
+
+
+def derive_effective_type(metadata: Mapping[str, Any], policy: Mapping[str, Any]) -> str:
+    candidates = []
+    for key in ("node_count_count_as", "node_count_type", "managed_node_type", "node_type", "k8s_kind", "cloud_resource_type"):
+        value = metadata.get(key)
+        if isinstance(value, list):
+            if value:
+                candidates.append(str(value[0]))
+        elif value not in (None, "", []):
+            candidates.append(str(value))
+
+    if not candidates:
+        return ""
+
+    raw_type = normalize_type_name(candidates[0])
+    alias = policy.get("type_aliases", {}).get(raw_type) or policy.get("count_as_types", {}).get(raw_type)
+    return normalize_type_name(alias or raw_type)
+
+
+def metadata_matches_any(value: Any, expected_values: Iterable[str]) -> bool:
+    expected = {normalize_scalar(str(item)) for item in expected_values}
+    if isinstance(value, list):
+        return any(normalize_scalar(str(item)) in expected for item in value)
+    if isinstance(value, bool):
+        candidate = "true" if value else "false"
+        return candidate in expected
+    if value in (None, "", []):
+        return False
+    return normalize_scalar(str(value)) in expected
+
+
+def normalize_type_name(value: str) -> str:
+    return normalize_scalar(value).replace(" ", "_").replace("-", "_")
+
+
 def parse_json_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -2247,15 +2579,39 @@ def parse_json_list(value: Any) -> list[str]:
     return [str(item) for item in loaded]
 
 
+def parse_json_mapping(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str):
+        return {}
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(loaded, Mapping):
+        return {}
+    return dict(loaded)
+
+
 def render_text_report(
     report: Mapping[str, Any],
     list_nodes: bool,
     identity_vars: tuple[str, ...],
     resolve_dns: bool,
 ) -> None:
+    policy = report.get("policy", {})
     print(f"Mode: {report['mode']}")
+    if policy:
+        print(f"Policy applied: {'yes' if policy.get('applied') else 'no'}")
+        print(f"Policy source: {policy.get('policy_file')}")
+        if "raw_unique_nodes" in policy:
+            print(f"Raw unique managed nodes: {policy.get('raw_unique_nodes')}")
     print(f"Source records examined: {report['total_source_records']}")
     print(f"Unique managed nodes: {report['total_unique_nodes']}")
+    if report.get("excluded_unique_nodes") is not None:
+        print(f"Excluded unique nodes: {report.get('excluded_unique_nodes')}")
     print(f"Deduplicated records: {report['deduplicated_records']}")
     print(f"Identity precedence: {', '.join(identity_vars)}, ansible_host, inventory_hostname")
     print(f"DNS resolution for alias collapse: {'enabled' if resolve_dns else 'disabled'}")
@@ -2278,8 +2634,24 @@ def render_text_report(
             f"(records={node.get('source_record_count')})"
         )
         print(f"   identity: {node.get('identity')}")
+        if node.get("effective_type"):
+            print(f"   type: {node.get('effective_type')}")
         print(f"   aliases: {aliases}")
         print(f"   inventories: {inventories}")
+
+    excluded_nodes = report.get("excluded_nodes", [])
+    if isinstance(excluded_nodes, list) and excluded_nodes:
+        print("")
+        print("Excluded Nodes:")
+        for index, node in enumerate(excluded_nodes, start=1):
+            print(
+                f"{index}. {node.get('display_name')} "
+                f"[{node.get('identity_source')}] "
+                f"({node.get('policy_reason')})"
+            )
+            print(f"   identity: {node.get('identity')}")
+            if node.get("effective_type"):
+                print(f"   type: {node.get('effective_type')}")
 
 
 def render_capture_report(
@@ -2302,9 +2674,15 @@ def render_capture_report(
 
 def render_window_report(report: Mapping[str, Any], list_nodes: bool) -> None:
     coverage = report.get("coverage", {})
+    policy = report.get("policy", {})
     print(f"Mode: {report['mode']}")
     if report.get("data_source"):
         print(f"Data source: {report['data_source']}")
+    if policy:
+        print(f"Policy applied: {'yes' if policy.get('applied') else 'no'}")
+        print(f"Policy source: {policy.get('policy_file')}")
+        if "raw_unique_nodes" in policy:
+            print(f"Raw unique managed nodes: {policy.get('raw_unique_nodes')}")
     print(f"State database: {report['state_db']}")
     if report.get("controller_key"):
         print(f"Controller scope: {report['controller_key']}")
@@ -2316,6 +2694,8 @@ def render_window_report(report: Mapping[str, Any], list_nodes: bool) -> None:
     else:
         print(f"Snapshots considered: {report['snapshots_considered']}")
     print(f"Unique managed nodes observed: {report['total_unique_nodes']}")
+    if report.get("excluded_unique_nodes") is not None:
+        print(f"Excluded unique nodes: {report.get('excluded_unique_nodes')}")
     print(f"Observation rows considered: {report['total_observations']}")
     print(f"Oldest observation in database: {coverage.get('first_capture')}")
     print(f"Newest observation in database: {coverage.get('last_capture')}")
@@ -2342,10 +2722,26 @@ def render_window_report(report: Mapping[str, Any], list_nodes: bool) -> None:
             f"({node_observation_label(node)})"
         )
         print(f"   identity: {node.get('identity')}")
+        if node.get("effective_type"):
+            print(f"   type: {node.get('effective_type')}")
         print(f"   first observed: {node.get('first_observed')}")
         print(f"   last observed: {node.get('last_observed')}")
         print(f"   aliases: {aliases}")
         print(f"   inventories: {inventories}")
+
+    excluded_nodes = report.get("excluded_nodes", [])
+    if isinstance(excluded_nodes, list) and excluded_nodes:
+        print("")
+        print("Excluded Nodes:")
+        for index, node in enumerate(excluded_nodes, start=1):
+            print(
+                f"{index}. {node.get('display_name')} "
+                f"[{node.get('identity_source')}] "
+                f"({node.get('policy_reason')})"
+            )
+            print(f"   identity: {node.get('identity')}")
+            if node.get("effective_type"):
+                print(f"   type: {node.get('effective_type')}")
 
 
 def node_observation_label(node: Mapping[str, Any]) -> str:
